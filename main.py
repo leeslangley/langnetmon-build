@@ -349,15 +349,15 @@ def _make_dot_image(hex_color: str, size: int = 64) -> Image.Image:
 _BG = "#1e1e1e"
 _FG_DIM = "#888888"
 _FG_LABEL = "#aaaaaa"
-_INDICATOR_PX = 18
-_FONT_SMALL = ("Segoe UI", 7)
-_FONT_LABEL = ("Segoe UI", 7, "bold")
+_INDICATOR_PX = 20
+_FONT_SMALL = ("Segoe UI", 9)
+_FONT_LABEL = ("Segoe UI", 9, "bold")
 
 class NetMonWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("LangNetmon v1.5")
-        self.root.geometry("260x95")
+        self.root.title(f"LangNetmon v{AGENT_VERSION}")
+        self.root.geometry("300x115")
         self.root.resizable(False, False)
         self.root.configure(bg=_BG)
         self.root.attributes("-topmost", True)
@@ -398,7 +398,7 @@ class NetMonWindow:
 
     def _build_time_label(self):
         self._ver_lbl = tk.Label(
-            self.root, text=f"v1.5",
+            self.root, text=f"v{AGENT_VERSION}",
             fg=_FG_DIM, bg=_BG, font=_FONT_SMALL,
         )
         self._ver_lbl.pack(side=tk.TOP, pady=(0, 0))
@@ -513,7 +513,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.2"
+AGENT_VERSION = "1.7.3"
 
 
 def _check_for_update(cfg: dict) -> None:
