@@ -153,9 +153,9 @@ def ping_color(results: list[dict]) -> str:
 def http_color(latency_ms: Optional[float], success: bool) -> str:
     if not success or latency_ms is None:
         return C_RED
-    if latency_ms > 250:
+    if latency_ms > 300:   # was 250 — relaxed by ~20%
         return C_RED
-    if latency_ms > 150:
+    if latency_ms > 180:   # was 150 — relaxed by ~20%
         return C_ORANGE
     return C_GREEN
 
@@ -416,6 +416,7 @@ class NetMonWindow:
         self._build_checkboxes()
 
         self._tray_icon: Optional[pystray.Icon] = None
+        self._prev_tray_color: str = C_GREEN  # track color changes for notifications
         threading.Thread(target=self._run_tray, daemon=True, name="tray").start()
 
         self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
@@ -563,13 +564,30 @@ class NetMonWindow:
                     self._tray_icon.icon = _make_dot_image(tray_color)
                 except Exception:
                     pass
+
+                # Fire a toast notification when status goes red and window is hidden
+                window_hidden = not self.root.winfo_viewable()
+                went_red = (tray_color == C_RED and self._prev_tray_color != C_RED)
+                if went_red and window_hidden and self._tray_icon:
+                    # Build a human-friendly message describing what went red
+                    problems = []
+                    if pc == C_RED:  problems.append("Internet ping failing")
+                    if gwc == C_RED: problems.append("Router unreachable")
+                    if hc == C_RED:  problems.append("HTTP checks failing")
+                    if mc == C_RED:  problems.append("Mac Studio unreachable")
+                    msg = " | ".join(problems) if problems else "Network issue detected"
+                    try:
+                        self._tray_icon.notify(msg, title="LangNetmon Alert")
+                    except Exception:
+                        pass
+                self._prev_tray_color = tray_color
         except Exception as e:
             log.error(f"GUI update error: {e}")
 
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.9"
+AGENT_VERSION = "1.8.0"
 
 
 def _check_for_update(cfg: dict) -> None:
