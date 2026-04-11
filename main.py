@@ -32,7 +32,7 @@ CONFIG_PATH = _HERE / "config.json"
 LOG_PATH = _HERE / "netmon_agent.log"
 
 DEFAULT_CONFIG = {
-    "mac_ip": "192.168.1.161",
+    "mac_ip": "192.168.1.100",
     "mac_port": 9876,
 }
 
@@ -191,10 +191,22 @@ def _http_check(url: str = "https://www.google.com") -> tuple[Optional[float], b
         t0 = time.monotonic()
         if parsed.scheme == "https":
             ctx = ssl.create_default_context()
-            conn = http.client.HTTPSConnection(ipv4, port, timeout=10, context=ctx)
-            conn.set_tunnel(hostname)  # SNI + Host header
+            # Pass hostname (not ipv4) as the host so HTTPSConnection sets SNI correctly,
+            # then override the connection address via _get_hostip trick using a custom
+            # socket. Simpler: create conn with hostname for SNI, override connect to use ipv4.
+            conn = http.client.HTTPSConnection(hostname, port, timeout=10, context=ctx)
+            # Monkey-patch connect to force IPv4 — avoids Windows IPv6 stall (~80s).
+            # HTTPSConnection is created with hostname so SNI is set correctly;
+            # we just override the socket creation to use the pre-resolved IPv4 addr.
+            def _ipv4_connect(bound_ipv4=ipv4, bound_port=port, bound_ctx=ctx, bound_host=hostname):
+                sock = socket.create_connection((bound_ipv4, bound_port), timeout=10)
+                conn.sock = bound_ctx.wrap_socket(sock, server_hostname=bound_host)
+            conn.connect = _ipv4_connect
         else:
-            conn = http.client.HTTPConnection(ipv4, port, timeout=10)
+            conn = http.client.HTTPConnection(hostname, port, timeout=10)
+            def _ipv4_connect(bound_ipv4=ipv4, bound_port=port):
+                conn.sock = socket.create_connection((bound_ipv4, bound_port), timeout=10)
+            conn.connect = _ipv4_connect
 
         conn.request("GET", parsed.path or "/", headers={"Host": hostname, "User-Agent": "netmon-agent/1.0"})
         resp = conn.getresponse()
@@ -487,7 +499,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.5"
+AGENT_VERSION = "1.6"
 
 
 def _check_for_update(cfg: dict) -> None:
