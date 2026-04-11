@@ -499,7 +499,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.6"
+AGENT_VERSION = "1.7"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -673,6 +673,100 @@ _POLL_NORMAL  = 30   # seconds between polls in normal mode
 _POLL_DIAG    = 5    # seconds between polls in diag mode
 
 
+# ── PowerShell remote session (long-poll) ────────────────────────────────
+# Agent keeps one persistent long-poll open to the Mac at all times.
+# Mac holds the request for up to 50s. When TARS queues a PS script via
+# POST /ps, the Mac flushes it down the open connection and the agent
+# runs it immediately, posts the result, then reconnects.
+# Round-trip latency: ~1-3s (execution time only).
+# Zero inbound ports opened on Windows.
+
+def _run_ps(script: str) -> tuple[str, str, int]:
+    """Run a PowerShell script, return (stdout, stderr, exit_code)."""
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NonInteractive",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command", script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "PowerShell execution timed out (60s)", 1
+    except Exception as e:
+        return "", f"PS exec error: {e}", 1
+
+
+def ps_session_loop(cfg: dict) -> None:
+    """
+    Persistent long-poll loop for remote PowerShell execution.
+    Opens GET /ps_session?hostname=X — Mac holds it open until a script
+    is queued. Agent receives script, runs it, POSTs result to /ps_result,
+    then immediately reconnects. Falls back to 5s retry on errors.
+    """
+    import socket as _sock
+    hostname = _sock.gethostname()
+    mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
+    session_url = f"{mac_base}/ps_session?hostname={hostname}"
+    result_url  = f"{mac_base}/ps_result"
+
+    log.info(f"PS session loop started → {mac_base}")
+
+    while True:
+        try:
+            # Long-poll: timeout slightly longer than server hold (55s)
+            req = urllib.request.Request(
+                session_url,
+                headers={"User-Agent": "netmon-agent/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=58) as resp:
+                data = json.loads(resp.read())
+
+            cmd = data.get("cmd")
+
+            if cmd == "noop":
+                # Server timeout, reconnect immediately
+                continue
+
+            if cmd == "ps_exec":
+                cid    = data.get("id", "?")
+                script = data.get("script", "")
+                log.info(f"PS exec [{cid}]: {script[:80]}")
+
+                stdout, stderr, exit_code = _run_ps(script)
+
+                payload = json.dumps({
+                    "hostname":  hostname,
+                    "id":        cid,
+                    "script":    script,
+                    "stdout":    stdout,
+                    "stderr":    stderr,
+                    "exit_code": exit_code,
+                }).encode()
+
+                post_req = urllib.request.Request(
+                    result_url,
+                    data=payload,
+                    headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"},
+                    method="POST",
+                )
+                urllib.request.urlopen(post_req, timeout=10)
+                log.info(f"PS result [{cid}] posted (exit={exit_code})")
+                # Reconnect immediately for next command
+                continue
+
+        except Exception as e:
+            log.debug(f"PS session error: {e} — reconnecting in 5s")
+            time.sleep(5)
+
+
 def _collect_diag_snapshot() -> dict:
     """Auto-collected state snapshot sent every poll in diag mode."""
     with state.lock:
@@ -773,6 +867,7 @@ def main() -> None:
         (report_loop,       (cfg,),    "report"),
         (_check_for_update, (cfg,),    "autoupdate"),
         (command_poll_loop, (cfg,),    "cmd-poll"),
+        (ps_session_loop,   (cfg,),    "ps-session"),
     ]:
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
         t.start()
