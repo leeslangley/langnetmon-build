@@ -499,7 +499,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7"
+AGENT_VERSION = "1.7.1"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -522,8 +522,14 @@ def _check_for_update(cfg: dict) -> None:
         except Exception:
             return (0,)
 
+    # Check on startup after a short delay, then every hour
+    first_run = True
     while True:
-        time.sleep(3600)
+        if first_run:
+            time.sleep(30)   # short delay to let network settle on startup
+            first_run = False
+        else:
+            time.sleep(3600)
         try:
             req = urllib.request.Request(version_url, headers={"User-Agent": "netmon-agent/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
