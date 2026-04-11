@@ -591,7 +591,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.8.3"
+AGENT_VERSION = "1.9.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -663,8 +663,14 @@ def _do_update_check(cfg: dict) -> bool:
         conn = _hc.HTTPConnection(ipv4, mac_port, timeout=120)
         conn.request("GET", f"/agent/NetMonAgent.exe", headers={"User-Agent": "netmon-agent/1.0"})
         resp = conn.getresponse()
-        tmp.write(resp.read())
+        exe_bytes = resp.read()
         conn.close()
+        if len(exe_bytes) < 1_000_000:  # sanity check — valid exe must be >1MB
+            log.error(f"Auto-update: download too small ({len(exe_bytes)} bytes) — aborting")
+            tmp.close()
+            os.unlink(tmp.name)
+            return False
+        tmp.write(exe_bytes)
         tmp.close()
 
         current_exe = sys.executable
@@ -962,9 +968,12 @@ def command_poll_loop(cfg: dict) -> None:
         }).encode()
         _ipv4_post(result_path, payload)
 
-    # Startup update check — runs immediately before first poll sleep
+    # Startup update check — retry until Mac is reachable (don't give up)
     log.info("Auto-update: checking on startup...")
-    _do_update_check(cfg)  # exits process if update found
+    for _attempt in range(10):  # up to 10 retries, 5s apart
+        if _do_update_check(cfg):  # returns True only if update triggered (exits)
+            break
+        time.sleep(5)
 
     while True:
         interval = _POLL_DIAG if _diag_mode else _POLL_NORMAL
@@ -1014,22 +1023,46 @@ def command_poll_loop(cfg: dict) -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────
 
+def _spawn_resilient(name: str, target, args: tuple) -> threading.Thread:
+    """Wrap a thread so any crash auto-restarts it after 5s."""
+    def _wrapper():
+        while True:
+            try:
+                target(*args)
+            except Exception as exc:
+                log.error(f"Thread '{name}' crashed: {exc} — restarting in 5s")
+                time.sleep(5)
+    t = threading.Thread(target=_wrapper, name=name, daemon=True)
+    t.start()
+    return t
+
+
 def main() -> None:
     _enforce_single_instance()  # exits immediately if another instance is running
     log.info(f"NetMon Windows Agent v{AGENT_VERSION} starting")
     cfg = load_config()
     log.info(f"Mac target: {cfg['mac_ip']}:{cfg['mac_port']}")
 
-    for target, args, name in [
-        (ping_loop,         (),        "ping"),
-        (gateway_ping_loop, (),        "gw-ping"),
-        (http_loop,         (),        "http"),
-        (report_loop,       (cfg,),    "report"),
-        (command_poll_loop, (cfg,),    "cmd-poll"),   # includes startup + 30s update checks
-        (ps_session_loop,   (cfg,),    "ps-session"),
-    ]:
-        t = threading.Thread(target=target, args=args, name=name, daemon=True)
-        t.start()
+    thread_specs = [
+        ("ping",       ping_loop,         ()),
+        ("gw-ping",    gateway_ping_loop,  ()),
+        ("http",       http_loop,          ()),
+        ("report",     report_loop,        (cfg,)),
+        ("cmd-poll",   command_poll_loop,  (cfg,)),
+        ("ps-session", ps_session_loop,    (cfg,)),
+    ]
+    live_threads = {name: _spawn_resilient(name, fn, args) for name, fn, args in thread_specs}
+
+    # Thread watchdog — restarts any dead thread every 30s
+    def _watchdog():
+        while True:
+            time.sleep(30)
+            for name, fn, args in thread_specs:
+                t = live_threads.get(name)
+                if t is None or not t.is_alive():
+                    log.warning(f"Watchdog: thread '{name}' dead — respawning")
+                    live_threads[name] = _spawn_resilient(name, fn, args)
+    threading.Thread(target=_watchdog, name="watchdog", daemon=True).start()
 
     root = tk.Tk()
     _app = NetMonWindow(root)
