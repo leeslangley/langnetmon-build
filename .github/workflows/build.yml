@@ -28,7 +28,7 @@ jobs:
           pyinstaller `
             --onefile `
             --windowed `
-            --name NetMonAgent-v1.8.0 `
+            --name NetMonAgent-v1.8.1 `
             --hidden-import pystray._win32 `
             --hidden-import PIL._tkinter_finder `
             --noconfirm `
@@ -37,6 +37,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NetMonAgent-v1.8.0-windows
-          path: dist/NetMonAgent-v1.8.0.exe
+          name: NetMonAgent-v1.8.1-windows
+          path: dist/NetMonAgent-v1.8.1.exe
           retention-days: 30

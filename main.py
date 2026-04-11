@@ -587,7 +587,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.8.0"
+AGENT_VERSION = "1.8.1"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -809,35 +809,54 @@ def _run_ps(script: str) -> tuple[str, str, int]:
         return "", f"PS exec error: {e}", 1
 
 
+def _ps_http_request(mac_ip: str, mac_port: int, method: str, path: str,
+                     body: Optional[bytes] = None, timeout: int = 58) -> bytes:
+    """
+    Low-level IPv4-forced HTTP helper for the PS session loop.
+    Uses http.client.HTTPConnection directly to bypass urllib's IPv6 preference.
+    """
+    import http.client as _hc
+    # Force IPv4 resolution — avoids Windows IPv6 stall (~80s)
+    ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+    conn = _hc.HTTPConnection(ipv4, mac_port, timeout=timeout)
+    headers = {"User-Agent": "netmon-agent/1.0"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return data
+
+
 def ps_session_loop(cfg: dict) -> None:
     """
     Persistent long-poll loop for remote PowerShell execution.
     Opens GET /ps_session?hostname=X — Mac holds it open until a script
     is queued. Agent receives script, runs it, POSTs result to /ps_result,
     then immediately reconnects. Falls back to 5s retry on errors.
+    Uses IPv4-forced http.client to avoid Windows IPv6 stall.
     """
     import socket as _sock
     hostname = _sock.gethostname()
-    mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
-    session_url = f"{mac_base}/ps_session?hostname={hostname}"
-    result_url  = f"{mac_base}/ps_result"
+    mac_ip   = cfg["mac_ip"]
+    mac_port = int(cfg["mac_port"])
 
-    log.info(f"PS session loop started → {mac_base}")
+    log.info(f"PS session loop started → {mac_ip}:{mac_port}")
 
     while True:
         try:
-            # Long-poll: timeout slightly longer than server hold (55s)
-            req = urllib.request.Request(
-                session_url,
-                headers={"User-Agent": "netmon-agent/1.0"},
+            # Long-poll: server holds up to 50s, we give it 58s
+            raw = _ps_http_request(
+                mac_ip, mac_port, "GET",
+                f"/ps_session?hostname={hostname}",
+                timeout=58,
             )
-            with urllib.request.urlopen(req, timeout=58) as resp:
-                data = json.loads(resp.read())
-
+            data = json.loads(raw)
             cmd = data.get("cmd")
 
             if cmd == "noop":
-                # Server timeout, reconnect immediately
+                # Server timeout — reconnect immediately
                 continue
 
             if cmd == "ps_exec":
@@ -856,19 +875,14 @@ def ps_session_loop(cfg: dict) -> None:
                     "exit_code": exit_code,
                 }).encode()
 
-                post_req = urllib.request.Request(
-                    result_url,
-                    data=payload,
-                    headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"},
-                    method="POST",
-                )
-                urllib.request.urlopen(post_req, timeout=10)
+                _ps_http_request(mac_ip, mac_port, "POST", "/ps_result",
+                                 body=payload, timeout=10)
                 log.info(f"PS result [{cid}] posted (exit={exit_code})")
                 # Reconnect immediately for next command
                 continue
 
         except Exception as e:
-            log.debug(f"PS session error: {e} — reconnecting in 5s")
+            log.warning(f"PS session error: {e} — reconnecting in 5s")
             time.sleep(5)
 
 
