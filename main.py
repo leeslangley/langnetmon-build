@@ -123,6 +123,7 @@ class _State:
         self.mac_reachable: bool = False
         self.mac_fail_since: Optional[datetime] = None  # when consecutive failures started
         self.last_update: datetime = datetime.now()
+        self.last_command_poll: datetime = datetime.now()  # tracks command poll loop timing
 
 state = _State()
 
@@ -528,7 +529,7 @@ class NetMonWindow:
     def _next_poll_in(self) -> int:
         """Seconds until the next command poll fires."""
         with state.lock:
-            last = state.last_update
+            last = state.last_command_poll
         elapsed = (datetime.now() - last).total_seconds()
         interval = _POLL_DIAG if _diag_mode else _POLL_NORMAL
         remaining = max(0, int(interval - elapsed))
@@ -568,7 +569,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.8"
+AGENT_VERSION = "1.7.9"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -902,6 +903,8 @@ def command_poll_loop(cfg: dict) -> None:
 
     while True:
         interval = _POLL_DIAG if _diag_mode else _POLL_NORMAL
+        with state.lock:
+            state.last_command_poll = datetime.now()
         time.sleep(interval)
 
         # Check for updates on every normal-mode poll (every 30s)
