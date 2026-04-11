@@ -38,5 +38,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: NetMonAgent-v1.4.1-windows
-          path: dist/NetMonAgent.exe
+          path: dist/NetMonAgent-v1.4.1.exe
           retention-days: 30
