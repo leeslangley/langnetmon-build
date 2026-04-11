@@ -21,6 +21,20 @@ from typing import Optional
 import urllib.request
 import urllib.error
 
+# ── Single-instance guard ─────────────────────────────────────────────────
+# Create a named Windows mutex. If it already exists another instance is
+# running — log and exit immediately.
+_MUTEX_NAME = "NetMonAgent_SingleInstance_Mutex"
+try:
+    import ctypes
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        import tkinter.messagebox as _mb
+        _mb.showwarning("NetMon Agent", "NetMon Agent is already running.")
+        sys.exit(0)
+except Exception:
+    pass  # non-Windows or ctypes unavailable — skip guard
+
 import tkinter as tk
 import pystray
 from PIL import Image, ImageDraw
@@ -499,7 +513,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.1"
+AGENT_VERSION = "1.7.2"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -516,63 +530,74 @@ def _check_for_update(cfg: dict) -> None:
     mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
     version_url = f"{mac_base}/version"
 
-    def ver_tuple(v):
-        try:
-            return tuple(int(x) for x in str(v).split("."))
-        except Exception:
-            return (0,)
+    pass  # placeholder — update logic moved to _do_update_check()
 
-    # Check on startup after a short delay, then every hour
-    first_run = True
-    while True:
-        if first_run:
-            time.sleep(30)   # short delay to let network settle on startup
-            first_run = False
-        else:
-            time.sleep(3600)
-        try:
-            req = urllib.request.Request(version_url, headers={"User-Agent": "netmon-agent/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-            remote_version = data.get("version", "0")
-            exe_url = data.get("url", "")
 
-            if not exe_url or ver_tuple(remote_version) <= ver_tuple(AGENT_VERSION):
-                log.debug(f"Auto-update: up to date (local={AGENT_VERSION} remote={remote_version})")
-                continue
+def _ver_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except Exception:
+        return (0,)
 
-            log.info(f"Auto-update: new version {remote_version} available, downloading...")
 
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe", dir=tempfile.gettempdir())
-            dl_req = urllib.request.Request(exe_url, headers={"User-Agent": "netmon-agent/1.0"})
-            with urllib.request.urlopen(dl_req, timeout=120) as resp:
-                tmp.write(resp.read())
-            tmp.close()
+def _do_update_check(cfg: dict) -> bool:
+    """
+    Check the Mac daemon for a newer agent version and self-update if found.
+    Returns True if an update was triggered (process will restart).
+    Only runs when frozen as a PyInstaller exe.
+    """
+    if not getattr(sys, "frozen", False):
+        log.debug("Auto-update: skipped (not frozen exe)")
+        return False
 
-            current_exe = sys.executable
-            bat = tempfile.NamedTemporaryFile(
-                delete=False, suffix=".bat", dir=tempfile.gettempdir(), mode="w"
-            )
-            bat.write(
-                f"@echo off\r\n"
-                f"timeout /t 3 /nobreak >nul\r\n"
-                f"copy /Y \"{tmp.name}\" \"{current_exe}\"\r\n"
-                f"del \"{tmp.name}\"\r\n"
-                f"start \"\" \"{current_exe}\"\r\n"
-                f"del \"%~f0\"\r\n"
-            )
-            bat.close()
+    import tempfile
+    mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
+    version_url = f"{mac_base}/version"
 
-            subprocess.Popen(
-                ["cmd", "/c", bat.name],
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-                close_fds=True,
-            )
-            log.info(f"Auto-update: v{remote_version} launcher started, exiting")
-            os._exit(0)
+    try:
+        req = urllib.request.Request(version_url, headers={"User-Agent": "netmon-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        remote_version = data.get("version", "0")
+        exe_url = data.get("url", "")
 
-        except Exception as e:
-            log.debug(f"Auto-update check failed: {e}")
+        if not exe_url or _ver_tuple(remote_version) <= _ver_tuple(AGENT_VERSION):
+            log.debug(f"Auto-update: up to date (local={AGENT_VERSION} remote={remote_version})")
+            return False
+
+        log.info(f"Auto-update: new version {remote_version} available, downloading...")
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe", dir=tempfile.gettempdir())
+        dl_req = urllib.request.Request(exe_url, headers={"User-Agent": "netmon-agent/1.0"})
+        with urllib.request.urlopen(dl_req, timeout=120) as resp:
+            tmp.write(resp.read())
+        tmp.close()
+
+        current_exe = sys.executable
+        bat = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".bat", dir=tempfile.gettempdir(), mode="w"
+        )
+        bat.write(
+            f"@echo off\r\n"
+            f"timeout /t 3 /nobreak >nul\r\n"
+            f"copy /Y \"{tmp.name}\" \"{current_exe}\"\r\n"
+            f"del \"{tmp.name}\"\r\n"
+            f"start \"\" \"{current_exe}\"\r\n"
+            f"del \"%~f0\"\r\n"
+        )
+        bat.close()
+
+        subprocess.Popen(
+            ["cmd", "/c", bat.name],
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            close_fds=True,
+        )
+        log.info(f"Auto-update: v{remote_version} launcher started, exiting")
+        os._exit(0)
+
+    except Exception as e:
+        log.debug(f"Auto-update check failed: {e}")
+    return False
 
 
 # ── Command poll (outbound-only diagnostics) ──────────────────────────────
@@ -790,7 +815,7 @@ def _collect_diag_snapshot() -> dict:
 def command_poll_loop(cfg: dict) -> None:
     """
     Poll Mac daemon for pending diagnostic commands. Outbound only — no inbound ports.
-    Normal mode: 30s interval.
+    Normal mode: 30s interval. Also checks for updates on every normal-mode poll.
     Diag mode (triggered by diag_start command): 5s interval + auto state snapshots.
     Returns to normal mode on diag_stop command.
     """
@@ -816,9 +841,17 @@ def command_poll_loop(cfg: dict) -> None:
         )
         urllib.request.urlopen(req, timeout=10)
 
+    # Startup update check — runs immediately before first poll sleep
+    log.info("Auto-update: checking on startup...")
+    _do_update_check(cfg)  # exits process if update found
+
     while True:
         interval = _POLL_DIAG if _diag_mode else _POLL_NORMAL
         time.sleep(interval)
+
+        # Check for updates on every normal-mode poll (every 30s)
+        if not _diag_mode:
+            _do_update_check(cfg)  # exits process if update found
         try:
             req = urllib.request.Request(
                 poll_url + f"&diag={'1' if _diag_mode else '0'}",
@@ -871,8 +904,7 @@ def main() -> None:
         (gateway_ping_loop, (),        "gw-ping"),
         (http_loop,         (),        "http"),
         (report_loop,       (cfg,),    "report"),
-        (_check_for_update, (cfg,),    "autoupdate"),
-        (command_poll_loop, (cfg,),    "cmd-poll"),
+        (command_poll_loop, (cfg,),    "cmd-poll"),   # includes startup + 30s update checks
         (ps_session_loop,   (cfg,),    "ps-session"),
     ]:
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
