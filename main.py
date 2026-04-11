@@ -121,6 +121,7 @@ class _State:
         self.http_latency_ms: Optional[float] = None
         self.http_success: bool = False
         self.mac_reachable: bool = False
+        self.mac_fail_since: Optional[datetime] = None  # when consecutive failures started
         self.last_update: datetime = datetime.now()
 
 state = _State()
@@ -323,14 +324,20 @@ def report_loop(cfg: dict) -> None:
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
-                reachable = resp.status == 200
-                with state.lock:
-                    state.mac_reachable = reachable
-                log.debug(f"Report sent to Mac (HTTP {resp.status})")
+                if resp.status == 200:
+                    with state.lock:
+                        state.mac_reachable = True
+                        state.mac_fail_since = None  # reset on success
+                    log.debug(f"Report sent to Mac (HTTP {resp.status})")
         except Exception as e:
             log.info(f"Report to Mac failed (unreachable?): {e}")
             with state.lock:
-                state.mac_reachable = False
+                if state.mac_fail_since is None:
+                    state.mac_fail_since = datetime.now()
+                # Only mark red after 60s of consecutive failures
+                elapsed = (datetime.now() - state.mac_fail_since).total_seconds()
+                if elapsed >= 60:
+                    state.mac_reachable = False
         time.sleep(max(0.0, 10.0 - (time.monotonic() - t0)))
 
 # ── Windows registry helpers ──────────────────────────────────────────────
@@ -561,7 +568,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.7"
+AGENT_VERSION = "1.7.8"
 
 
 def _check_for_update(cfg: dict) -> None:
