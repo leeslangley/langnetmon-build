@@ -28,23 +28,16 @@ from PIL import Image, ImageDraw
 # ── Paths & config ─────────────────────────────────────────────────────────
 
 _HERE = Path(__file__).parent
-CONFIG_PATH = _HERE / "config.json"
 LOG_PATH = _HERE / "netmon_agent.log"
 
+# Hardcoded for Langley home LAN — Mac Studio at 192.168.1.161
 DEFAULT_CONFIG = {
-    "mac_ip": "192.168.1.100",
+    "mac_ip": "192.168.1.161",
     "mac_port": 9876,
 }
 
 def load_config() -> dict:
-    cfg = DEFAULT_CONFIG.copy()
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, encoding="utf-8") as f:
-                cfg.update(json.load(f))
-        except Exception as e:
-            logging.warning(f"Failed to load config: {e}")
-    return cfg
+    return DEFAULT_CONFIG.copy()
 
 # ── Logging ───────────────────────────────────────────────────────────────
 

@@ -29,20 +29,14 @@ jobs:
             --onefile `
             --windowed `
             --name NetMonAgent `
-            --add-data "config.json;." `
             --hidden-import pystray._win32 `
             --hidden-import PIL._tkinter_finder `
             --noconfirm `
             main.py
 
-      - name: Copy config to dist
-        run: copy config.json dist\config.json
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: NetMonAgent-windows
-          path: |
-            dist/NetMonAgent.exe
-            dist/config.json
+          path: dist/NetMonAgent.exe
           retention-days: 30
