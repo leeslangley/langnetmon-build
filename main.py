@@ -28,25 +28,48 @@ import urllib.error
 _SINGLETON_MUTEX = None
 
 def _enforce_single_instance() -> None:
+    """
+    Kill any other running NetMonAgent processes, then acquire the singleton
+    mutex so future launches also clean up cleanly.
+    """
     global _SINGLETON_MUTEX
+    my_pid = os.getpid()
+    my_name = Path(sys.executable).stem.lower()  # e.g. 'netmonagent-v1.7.6'
+
+    # Kill all other NetMonAgent processes by name match (case-insensitive)
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for line in result.stdout.splitlines():
+            parts = [p.strip('"') for p in line.split(',')]
+            if len(parts) < 2:
+                continue
+            proc_name = parts[0].lower()
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                continue
+            if pid == my_pid:
+                continue
+            if 'netmonagent' in proc_name:
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+    except Exception:
+        pass
+
+    # Acquire mutex so this instance is the definitive owner
     try:
         import ctypes
-        ERROR_ALREADY_EXISTS = 183
         mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "NetMonAgent_SingleInstance_Mutex")
-        if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            # Another instance is running — show a simple Windows message box
-            # using the raw Win32 API (no Tk needed at this point)
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "NetMon Agent is already running.",
-                "NetMon Agent",
-                0x30,  # MB_ICONWARNING | MB_OK
-            )
-            sys.exit(0)
-        # Keep the handle alive so the mutex stays owned by this process
-        _SINGLETON_MUTEX = mutex
+        _SINGLETON_MUTEX = mutex  # keep alive for process lifetime
     except Exception:
-        pass  # non-Windows / ctypes unavailable — skip guard
+        pass  # non-Windows / ctypes unavailable — skip
 
 import tkinter as tk
 import pystray
@@ -528,7 +551,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.5"
+AGENT_VERSION = "1.7.6"
 
 
 def _check_for_update(cfg: dict) -> None:
