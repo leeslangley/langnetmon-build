@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
     "mac_port": 9876,
 }
 
-def load_config() -> dict:  # hardcoded for home LAN
+def load_config() -> dict:
     cfg = DEFAULT_CONFIG.copy()
     if CONFIG_PATH.exists():
         try:
@@ -474,18 +474,91 @@ class NetMonWindow:
             log.error(f"GUI update error: {e}")
 
 
+# ── Version & auto-update ──────────────────────────────────────────────────
+
+AGENT_VERSION = "1.3"
+
+
+def _check_for_update(cfg: dict) -> None:
+    """
+    Hourly auto-update check against Mac daemon /version endpoint.
+    If newer version found: downloads exe, launches bat to replace-and-restart.
+    Only active when running as frozen PyInstaller exe.
+    """
+    if not getattr(sys, "frozen", False):
+        log.info("Auto-update: skipped (not frozen exe)")
+        return
+
+    import tempfile
+    mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
+    version_url = f"{mac_base}/version"
+
+    def ver_tuple(v):
+        try:
+            return tuple(int(x) for x in str(v).split("."))
+        except Exception:
+            return (0,)
+
+    while True:
+        time.sleep(3600)
+        try:
+            req = urllib.request.Request(version_url, headers={"User-Agent": "netmon-agent/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            remote_version = data.get("version", "0")
+            exe_url = data.get("url", "")
+
+            if not exe_url or ver_tuple(remote_version) <= ver_tuple(AGENT_VERSION):
+                log.debug(f"Auto-update: up to date (local={AGENT_VERSION} remote={remote_version})")
+                continue
+
+            log.info(f"Auto-update: new version {remote_version} available, downloading...")
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe", dir=tempfile.gettempdir())
+            dl_req = urllib.request.Request(exe_url, headers={"User-Agent": "netmon-agent/1.0"})
+            with urllib.request.urlopen(dl_req, timeout=120) as resp:
+                tmp.write(resp.read())
+            tmp.close()
+
+            current_exe = sys.executable
+            bat = tempfile.NamedTemporaryFile(
+                delete=False, suffix=".bat", dir=tempfile.gettempdir(), mode="w"
+            )
+            bat.write(
+                f"@echo off\r\n"
+                f"timeout /t 3 /nobreak >nul\r\n"
+                f"copy /Y \"{tmp.name}\" \"{current_exe}\"\r\n"
+                f"del \"{tmp.name}\"\r\n"
+                f"start \"\" \"{current_exe}\"\r\n"
+                f"del \"%~f0\"\r\n"
+            )
+            bat.close()
+
+            subprocess.Popen(
+                ["cmd", "/c", bat.name],
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                close_fds=True,
+            )
+            log.info(f"Auto-update: v{remote_version} launcher started, exiting")
+            os._exit(0)
+
+        except Exception as e:
+            log.debug(f"Auto-update check failed: {e}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
-    log.info("NetMon Windows Agent starting")
+    log.info(f"NetMon Windows Agent v{AGENT_VERSION} starting")
     cfg = load_config()
     log.info(f"Mac target: {cfg['mac_ip']}:{cfg['mac_port']}")
 
     for target, args, name in [
-        (ping_loop,         (),      "ping"),
-        (gateway_ping_loop, (),      "gw-ping"),
-        (http_loop,         (),      "http"),
-        (report_loop,       (cfg,),  "report"),
+        (ping_loop,         (),        "ping"),
+        (gateway_ping_loop, (),        "gw-ping"),
+        (http_loop,         (),        "http"),
+        (report_loop,       (cfg,),    "report"),
+        (_check_for_update, (cfg,),    "autoupdate"),
     ]:
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
         t.start()
