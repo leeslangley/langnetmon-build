@@ -518,6 +518,15 @@ class NetMonWindow:
         self._do_update()
         self.root.after(1000, self._schedule_update)
 
+    def _next_poll_in(self) -> int:
+        """Seconds until the next command poll fires."""
+        with state.lock:
+            last = state.last_update
+        elapsed = (datetime.now() - last).total_seconds()
+        interval = _POLL_DIAG if _diag_mode else _POLL_NORMAL
+        remaining = max(0, int(interval - elapsed))
+        return remaining
+
     def _do_update(self):
         try:
             with state.lock:
@@ -537,7 +546,8 @@ class NetMonWindow:
             self._set_indicator("GW", gwc)
             self._set_indicator("HTTP", hc)
             self._set_indicator("MAC", mc)
-            self._time_lbl.config(text=f"Updated: {last_upd.strftime('%H:%M:%S')}")
+            countdown = self._next_poll_in()
+            self._time_lbl.config(text=f"Next check in {countdown}s")
 
             if self._tray_icon is not None:
                 tray_color = worst_color(pc, gwc, hc, mc)
@@ -551,7 +561,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.6"
+AGENT_VERSION = "1.7.7"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -738,7 +748,7 @@ def _run_command(cmd: str, args: dict) -> dict:
 
 # Diag mode flag — set to True when Mac sends "diag_start" command
 _diag_mode = False
-_POLL_NORMAL  = 30   # seconds between polls in normal mode
+_POLL_NORMAL  = 15   # seconds between polls in normal mode
 _POLL_DIAG    = 5    # seconds between polls in diag mode
 
 
