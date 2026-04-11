@@ -22,18 +22,31 @@ import urllib.request
 import urllib.error
 
 # ── Single-instance guard ─────────────────────────────────────────────────
-# Create a named Windows mutex. If it already exists another instance is
-# running — log and exit immediately.
-_MUTEX_NAME = "NetMonAgent_SingleInstance_Mutex"
-try:
-    import ctypes
-    _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        import tkinter.messagebox as _mb
-        _mb.showwarning("NetMon Agent", "NetMon Agent is already running.")
-        sys.exit(0)
-except Exception:
-    pass  # non-Windows or ctypes unavailable — skip guard
+# Use a named Windows mutex to ensure only one instance runs at a time.
+# Must be called before any other startup logic. The mutex handle is kept
+# alive in _SINGLETON_MUTEX so GC doesn't release it.
+_SINGLETON_MUTEX = None
+
+def _enforce_single_instance() -> None:
+    global _SINGLETON_MUTEX
+    try:
+        import ctypes
+        ERROR_ALREADY_EXISTS = 183
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "NetMonAgent_SingleInstance_Mutex")
+        if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            # Another instance is running — show a simple Windows message box
+            # using the raw Win32 API (no Tk needed at this point)
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "NetMon Agent is already running.",
+                "NetMon Agent",
+                0x30,  # MB_ICONWARNING | MB_OK
+            )
+            sys.exit(0)
+        # Keep the handle alive so the mutex stays owned by this process
+        _SINGLETON_MUTEX = mutex
+    except Exception:
+        pass  # non-Windows / ctypes unavailable — skip guard
 
 import tkinter as tk
 import pystray
@@ -515,7 +528,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.4"
+AGENT_VERSION = "1.7.5"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -897,6 +910,7 @@ def command_poll_loop(cfg: dict) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
+    _enforce_single_instance()  # exits immediately if another instance is running
     log.info(f"NetMon Windows Agent v{AGENT_VERSION} starting")
     cfg = load_config()
     log.info(f"Mac target: {cfg['mac_ip']}:{cfg['mac_port']}")
