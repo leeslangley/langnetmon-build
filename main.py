@@ -82,19 +82,17 @@ CONFIG_PATH = _HERE / "config.json"
 LOG_PATH = _HERE / "netmon_agent.log"
 
 DEFAULT_CONFIG = {
-    "mac_ip": "192.168.1.161",
+    "mac_ip": "192.168.1.161",  # hardcoded — do not override
     "mac_port": 9876,
 }
 
+MAC_IP   = "192.168.1.161"  # always use this — ignore any saved config
+MAC_PORT = 9876
+
 def load_config() -> dict:
-    cfg = DEFAULT_CONFIG.copy()
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, encoding="utf-8") as f:
-                cfg.update(json.load(f))
-        except Exception as e:
-            logging.warning(f"Failed to load config: {e}")
-    return cfg
+    """Always return the hardcoded defaults. Config file is ignored for mac_ip/mac_port
+    to avoid stale configs on reinstall breaking connectivity."""
+    return {"mac_ip": MAC_IP, "mac_port": MAC_PORT}
 
 # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -591,7 +589,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.9.0"
+AGENT_VERSION = "1.9.1"
 
 
 def _check_for_update(cfg: dict) -> None:
