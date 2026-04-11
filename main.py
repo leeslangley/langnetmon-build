@@ -289,8 +289,10 @@ def http_loop() -> None:
 # ── Report to Mac ─────────────────────────────────────────────────────────
 
 def report_loop(cfg: dict) -> None:
-    mac_url = f"http://{cfg['mac_ip']}:{cfg['mac_port']}/report"
-    log.info(f"Report loop started → {mac_url} every 10s")
+    import http.client as _hc
+    mac_ip   = cfg["mac_ip"]
+    mac_port = int(cfg["mac_port"])
+    log.info(f"Report loop started → {mac_ip}:{mac_port} every 10s")
     while True:
         t0 = time.monotonic()
         try:
@@ -319,17 +321,18 @@ def report_loop(cfg: dict) -> None:
                 "timestamp": datetime.utcnow().isoformat(),
             }
             data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                mac_url, data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                if resp.status == 200:
-                    with state.lock:
-                        state.mac_reachable = True
-                        state.mac_fail_since = None  # reset on success
-                    log.debug(f"Report sent to Mac (HTTP {resp.status})")
+            # IPv4-forced POST — avoids Windows IPv6 stall
+            ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+            conn = _hc.HTTPConnection(ipv4, mac_port, timeout=5)
+            conn.request("POST", "/report", body=data,
+                         headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"})
+            resp = conn.getresponse()
+            if resp.status == 200:
+                with state.lock:
+                    state.mac_reachable = True
+                    state.mac_fail_since = None  # reset on success
+                log.debug(f"Report sent to Mac (HTTP {resp.status})")
+            resp.read(); conn.close()
         except Exception as e:
             log.info(f"Report to Mac failed (unreachable?): {e}")
             with state.lock:
@@ -587,7 +590,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.8.1"
+AGENT_VERSION = "1.8.2"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -614,6 +617,18 @@ def _ver_tuple(v):
         return (0,)
 
 
+def _mac_http_get_ipv4(mac_ip: str, mac_port: int, path: str, timeout: int = 10) -> bytes:
+    """IPv4-forced HTTP GET to the Mac daemon — avoids Windows IPv6 stall."""
+    import http.client as _hc
+    ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+    conn = _hc.HTTPConnection(ipv4, mac_port, timeout=timeout)
+    conn.request("GET", path, headers={"User-Agent": "netmon-agent/1.0"})
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return data
+
+
 def _do_update_check(cfg: dict) -> bool:
     """
     Check the Mac daemon for a newer agent version and self-update if found.
@@ -625,13 +640,12 @@ def _do_update_check(cfg: dict) -> bool:
         return False
 
     import tempfile
-    mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
-    version_url = f"{mac_base}/version"
+    mac_ip   = cfg["mac_ip"]
+    mac_port = int(cfg["mac_port"])
 
     try:
-        req = urllib.request.Request(version_url, headers={"User-Agent": "netmon-agent/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+        raw = _mac_http_get_ipv4(mac_ip, mac_port, "/version", timeout=10)
+        data = json.loads(raw)
         remote_version = data.get("version", "0")
         exe_url = data.get("url", "")
 
@@ -642,9 +656,14 @@ def _do_update_check(cfg: dict) -> bool:
         log.info(f"Auto-update: new version {remote_version} available, downloading...")
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".exe", dir=tempfile.gettempdir())
-        dl_req = urllib.request.Request(exe_url, headers={"User-Agent": "netmon-agent/1.0"})
-        with urllib.request.urlopen(dl_req, timeout=120) as resp:
-            tmp.write(resp.read())
+        # Download EXE — use IPv4-forced connection too
+        ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+        import http.client as _hc
+        conn = _hc.HTTPConnection(ipv4, mac_port, timeout=120)
+        conn.request("GET", f"/agent/NetMonAgent.exe", headers={"User-Agent": "netmon-agent/1.0"})
+        resp = conn.getresponse()
+        tmp.write(resp.read())
+        conn.close()
         tmp.close()
 
         current_exe = sys.executable
@@ -909,10 +928,29 @@ def command_poll_loop(cfg: dict) -> None:
     """
     global _diag_mode
     import socket as _sock
+    import http.client as _hc
     hostname = _sock.gethostname()
-    mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
-    poll_url = f"{mac_base}/commands?hostname={hostname}"
-    result_url = f"{mac_base}/command_result"
+    mac_ip   = cfg["mac_ip"]
+    mac_port = int(cfg["mac_port"])
+
+    def _ipv4_get(path: str, timeout: int = 10) -> bytes:
+        """IPv4-forced GET to Mac daemon."""
+        ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+        conn = _hc.HTTPConnection(ipv4, mac_port, timeout=timeout)
+        conn.request("GET", path, headers={"User-Agent": "netmon-agent/1.0"})
+        resp = conn.getresponse(); data = resp.read(); conn.close()
+        return data
+
+    def _ipv4_post(path: str, payload: bytes, timeout: int = 10) -> None:
+        """IPv4-forced POST to Mac daemon."""
+        ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+        conn = _hc.HTTPConnection(ipv4, mac_port, timeout=timeout)
+        conn.request("POST", path, body=payload,
+                     headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"})
+        resp = conn.getresponse(); resp.read(); conn.close()
+
+    poll_path   = f"/commands?hostname={hostname}"
+    result_path = "/command_result"
 
     def post_result(cmd_id, cmd, result):
         payload = json.dumps({
@@ -921,13 +959,7 @@ def command_poll_loop(cfg: dict) -> None:
             "cmd": cmd,
             "result": result,
         }).encode()
-        req = urllib.request.Request(
-            result_url,
-            data=payload,
-            headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"},
-            method="POST"
-        )
-        urllib.request.urlopen(req, timeout=10)
+        _ipv4_post(result_path, payload)
 
     # Startup update check — runs immediately before first poll sleep
     log.info("Auto-update: checking on startup...")
@@ -943,12 +975,9 @@ def command_poll_loop(cfg: dict) -> None:
         if not _diag_mode:
             _do_update_check(cfg)  # exits process if update found
         try:
-            req = urllib.request.Request(
-                poll_url + f"&diag={'1' if _diag_mode else '0'}",
-                headers={"User-Agent": "netmon-agent/1.0"}
+            commands = json.loads(
+                _ipv4_get(poll_path + f"&diag={'1' if _diag_mode else '0'}")
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                commands = json.loads(resp.read())
 
             # In diag mode, auto-send a state snapshot every poll even if no commands
             if _diag_mode:
