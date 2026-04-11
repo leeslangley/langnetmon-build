@@ -46,7 +46,7 @@ CONFIG_PATH = _HERE / "config.json"
 LOG_PATH = _HERE / "netmon_agent.log"
 
 DEFAULT_CONFIG = {
-    "mac_ip": "192.168.1.100",
+    "mac_ip": "192.168.1.161",
     "mac_port": 9876,
 }
 
@@ -356,7 +356,9 @@ _FONT_LABEL = ("Segoe UI", 9, "bold")
 class NetMonWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f"LangNetmon v{AGENT_VERSION}")
+        import socket as _s
+        _hostname = _s.gethostname()
+        self.root.title(f"LangNetmon v{AGENT_VERSION} — {_hostname}")
         self.root.geometry("300x115")
         self.root.resizable(False, False)
         self.root.configure(bg=_BG)
@@ -513,7 +515,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.7.3"
+AGENT_VERSION = "1.7.4"
 
 
 def _check_for_update(cfg: dict) -> None:
