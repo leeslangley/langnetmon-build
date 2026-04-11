@@ -476,7 +476,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.4"
+AGENT_VERSION = "1.4.1"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -644,40 +644,92 @@ def _run_command(cmd: str, args: dict) -> dict:
         return {"error": str(e)}
 
 
+# Diag mode flag — set to True when Mac sends "diag_start" command
+_diag_mode = False
+_POLL_NORMAL  = 30   # seconds between polls in normal mode
+_POLL_DIAG    = 5    # seconds between polls in diag mode
+
+
+def _collect_diag_snapshot() -> dict:
+    """Auto-collected state snapshot sent every poll in diag mode."""
+    with state.lock:
+        snap = {
+            "ping_ms":        state.ping_latency_ms,
+            "ping_ok":        state.ping_success,
+            "gw_ping_ms":     state.gw_ping_latency_ms,
+            "gw_ok":          state.gw_ping_success,
+            "http_latency_ms": state.http_latency_ms,
+            "http_success":   state.http_success,
+        }
+    return snap
+
+
 def command_poll_loop(cfg: dict) -> None:
-    """Poll Mac daemon for pending diagnostic commands every 30s. Outbound only."""
+    """
+    Poll Mac daemon for pending diagnostic commands. Outbound only — no inbound ports.
+    Normal mode: 30s interval.
+    Diag mode (triggered by diag_start command): 5s interval + auto state snapshots.
+    Returns to normal mode on diag_stop command.
+    """
+    global _diag_mode
     import socket as _sock
     hostname = _sock.gethostname()
     mac_base = f"http://{cfg['mac_ip']}:{cfg['mac_port']}"
     poll_url = f"{mac_base}/commands?hostname={hostname}"
     result_url = f"{mac_base}/command_result"
 
+    def post_result(cmd_id, cmd, result):
+        payload = json.dumps({
+            "id": cmd_id,
+            "hostname": hostname,
+            "cmd": cmd,
+            "result": result,
+        }).encode()
+        req = urllib.request.Request(
+            result_url,
+            data=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"},
+            method="POST"
+        )
+        urllib.request.urlopen(req, timeout=10)
+
     while True:
-        time.sleep(30)
+        interval = _POLL_DIAG if _diag_mode else _POLL_NORMAL
+        time.sleep(interval)
         try:
-            req = urllib.request.Request(poll_url, headers={"User-Agent": "netmon-agent/1.0"})
+            req = urllib.request.Request(
+                poll_url + f"&diag={'1' if _diag_mode else '0'}",
+                headers={"User-Agent": "netmon-agent/1.0"}
+            )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 commands = json.loads(resp.read())
 
+            # In diag mode, auto-send a state snapshot every poll even if no commands
+            if _diag_mode:
+                snap = _collect_diag_snapshot()
+                post_result("auto-snap", "state", snap)
+                log.debug(f"Diag snapshot sent: {snap}")
+
             for item in commands:
                 cmd_id = item.get("id")
-                cmd = item.get("cmd")
-                args = item.get("args", {})
-                log.info(f"Running command: {cmd} {args}")
+                cmd    = item.get("cmd")
+                args   = item.get("args", {})
+
+                # Control commands — handled locally, no result needed
+                if cmd == "diag_start":
+                    _diag_mode = True
+                    log.info("Diag mode ENABLED — polling every 5s")
+                    post_result(cmd_id, cmd, {"status": "diag mode enabled", "poll_interval": _POLL_DIAG})
+                    continue
+                elif cmd == "diag_stop":
+                    _diag_mode = False
+                    log.info("Diag mode DISABLED — polling every 30s")
+                    post_result(cmd_id, cmd, {"status": "diag mode disabled", "poll_interval": _POLL_NORMAL})
+                    continue
+
+                log.info(f"Running command [{cmd_id}]: {cmd} {args}")
                 result = _run_command(cmd, args)
-                payload = json.dumps({
-                    "id": cmd_id,
-                    "hostname": hostname,
-                    "cmd": cmd,
-                    "result": result,
-                }).encode()
-                res_req = urllib.request.Request(
-                    result_url,
-                    data=payload,
-                    headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"},
-                    method="POST"
-                )
-                urllib.request.urlopen(res_req, timeout=10)
+                post_result(cmd_id, cmd, result)
                 log.info(f"Command {cmd_id} result posted")
 
         except Exception as e:
