@@ -312,6 +312,7 @@ def report_loop(cfg: dict) -> None:
 
             payload = {
                 "hostname": os.environ.get("COMPUTERNAME", "windows-agent"),
+                "agent_version": AGENT_VERSION,
                 "ping_latency_ms": avg_ping,
                 "ping_success": ping_ok,
                 "gateway_ping_latency_ms": avg_gw_ping,
@@ -590,7 +591,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.8.2"
+AGENT_VERSION = "1.8.3"
 
 
 def _check_for_update(cfg: dict) -> None:
