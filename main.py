@@ -728,7 +728,6 @@ def command_poll_loop(cfg: dict) -> None:
 
                 # Control commands — handled locally, no result needed
                 if cmd == "diag_start":
-                    global _diag_mode
                     _diag_mode = True
                     log.info("Diag mode ENABLED — polling every 5s")
                     post_result(cmd_id, cmd, {"status": "diag mode enabled", "poll_interval": _POLL_DIAG})
