@@ -476,7 +476,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.3"
+AGENT_VERSION = "1.4"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -546,6 +546,141 @@ def _check_for_update(cfg: dict) -> None:
             log.debug(f"Auto-update check failed: {e}")
 
 
+# ── Remote diagnostics server ─────────────────────────────────────────────
+# Listens on port 9877 — Mac can query for on-demand network diagnostics
+
+import http.server as _http_server
+import socketserver as _socketserver
+
+DIAG_PORT = 9877
+
+class DiagHandler(_http_server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        log.debug(f"DiagServer: {fmt % args}")
+
+    def do_GET(self):
+        import subprocess, socket, time, json as _json, urllib.parse
+
+        path = self.path.split("?")[0]
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+
+        result = {}
+        try:
+            if path == "/diag/dns":
+                host = params.get("host", "www.google.com")
+                t0 = time.monotonic()
+                ipv4 = socket.getaddrinfo(host, 80, socket.AF_INET)[0][4][0]
+                ipv6 = None
+                try:
+                    ipv6 = socket.getaddrinfo(host, 80, socket.AF_INET6)[0][4][0]
+                except Exception:
+                    pass
+                result = {"host": host, "ipv4": ipv4, "ipv6": ipv6, "dns_ms": round((time.monotonic()-t0)*1000,1)}
+
+            elif path == "/diag/tcp":
+                host = params.get("host", "www.google.com")
+                port = int(params.get("port", 443))
+                af = socket.AF_INET
+                addrs = socket.getaddrinfo(host, port, af)
+                ip = addrs[0][4][0]
+                t0 = time.monotonic()
+                s = socket.socket(af, socket.SOCK_STREAM)
+                s.settimeout(10)
+                s.connect((ip, port))
+                s.close()
+                result = {"host": host, "ip": ip, "port": port, "connect_ms": round((time.monotonic()-t0)*1000,1)}
+
+            elif path == "/diag/http":
+                import ssl, http.client
+                from urllib.parse import urlparse as _up
+                url = params.get("url", "https://www.google.com")
+                parsed = _up(url)
+                hostname = parsed.hostname
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                # DNS
+                t_dns = time.monotonic()
+                ipv4 = socket.getaddrinfo(hostname, port, socket.AF_INET)[0][4][0]
+                dns_ms = round((time.monotonic()-t_dns)*1000, 1)
+                # Connect + request
+                t0 = time.monotonic()
+                if parsed.scheme == "https":
+                    ctx = ssl.create_default_context()
+                    conn = http.client.HTTPSConnection(ipv4, port, timeout=15, context=ctx)
+                    conn.set_tunnel(hostname)
+                else:
+                    conn = http.client.HTTPConnection(ipv4, port, timeout=15)
+                conn.request("GET", parsed.path or "/", headers={"Host": hostname, "User-Agent": "netmon-diag/1.0"})
+                resp = conn.getresponse()
+                total_ms = round((time.monotonic()-t0)*1000, 1)
+                resp.read(); conn.close()
+                result = {"url": url, "ip": ipv4, "dns_ms": dns_ms, "total_ms": total_ms, "status": resp.status}
+
+            elif path == "/diag/tracert":
+                host = params.get("host", "8.8.8.8")
+                proc = subprocess.run(
+                    ["tracert", "-d", "-w", "1000", "-h", "15", host],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                result = {"host": host, "output": proc.stdout}
+
+            elif path == "/diag/ping":
+                host = params.get("host", "8.8.8.8")
+                count = min(int(params.get("count", "4")), 10)
+                proc = subprocess.run(
+                    ["ping", "-n", str(count), host],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                result = {"host": host, "output": proc.stdout}
+
+            elif path == "/diag/ipconfig":
+                proc = subprocess.run(
+                    ["ipconfig", "/all"],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                result = {"output": proc.stdout}
+
+            elif path == "/diag/state":
+                with state.lock:
+                    result = {
+                        "version": AGENT_VERSION,
+                        "ping_ms": state.ping_latency_ms,
+                        "gw_ping_ms": state.gw_ping_latency_ms,
+                        "http_latency_ms": state.http_latency_ms,
+                        "http_success": state.http_success,
+                        "ping_ok": state.ping_success,
+                        "gw_ok": state.gw_ping_success,
+                    }
+            else:
+                result = {"error": f"unknown path {path}", "available": [
+                    "/diag/state", "/diag/dns?host=", "/diag/tcp?host=&port=",
+                    "/diag/http?url=", "/diag/tracert?host=", "/diag/ping?host=&count=",
+                    "/diag/ipconfig"
+                ]}
+
+        except Exception as e:
+            result = {"error": str(e)}
+
+        body = _json.dumps(result, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def diag_server_loop() -> None:
+    try:
+        server = _socketserver.TCPServer(("0.0.0.0", DIAG_PORT), DiagHandler)
+        server.allow_reuse_address = True
+        log.info(f"Diag server listening on port {DIAG_PORT}")
+        server.serve_forever()
+    except Exception as e:
+        log.error(f"Diag server failed: {e}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -559,6 +694,7 @@ def main() -> None:
         (http_loop,         (),        "http"),
         (report_loop,       (cfg,),    "report"),
         (_check_for_update, (cfg,),    "autoupdate"),
+        (diag_server_loop,  (),        "diag-server"),
     ]:
         t = threading.Thread(target=target, args=args, name=name, daemon=True)
         t.start()
