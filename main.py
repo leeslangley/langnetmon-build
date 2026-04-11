@@ -330,7 +330,7 @@ _FONT_LABEL = ("Segoe UI", 7, "bold")
 class NetMonWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Net Monitor")
+        self.root.title("LangNetmon v1.5")
         self.root.geometry("260x95")
         self.root.resizable(False, False)
         self.root.configure(bg=_BG)
@@ -347,6 +347,7 @@ class NetMonWindow:
         threading.Thread(target=self._run_tray, daemon=True, name="tray").start()
 
         self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
+        self.root.bind("<Unmap>", self._on_minimize)
         self._schedule_update()
 
     # ── UI construction ───────────────────────────────────────────────────
@@ -370,6 +371,11 @@ class NetMonWindow:
             self._canvases[label] = (c, oval_id)
 
     def _build_time_label(self):
+        self._ver_lbl = tk.Label(
+            self.root, text=f"v1.5",
+            fg=_FG_DIM, bg=_BG, font=_FONT_SMALL,
+        )
+        self._ver_lbl.pack(side=tk.TOP, pady=(0, 0))
         self._time_lbl = tk.Label(
             self.root, text="Updated: --:--:--",
             fg=_FG_DIM, bg=_BG, font=_FONT_SMALL,
@@ -411,6 +417,11 @@ class NetMonWindow:
     def _hide_window(self, icon=None, item=None):
         self.root.after(0, self.root.withdraw)
 
+    def _on_minimize(self, event=None):
+        """Intercept minimise — hide to tray instead of taskbar."""
+        if event and event.widget == self.root:
+            self.root.after(0, self.root.withdraw)
+
     def _quit(self, icon=None, item=None):
         if self._tray_icon:
             self._tray_icon.stop()
@@ -428,7 +439,7 @@ class NetMonWindow:
         self._tray_icon = pystray.Icon(
             "NetMon",
             _make_dot_image(C_GREY),
-            "Net Monitor",
+            f"LangNetmon v{AGENT_VERSION}",
             menu=menu,
         )
         self._tray_icon.run()
@@ -476,7 +487,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.4.1"
+AGENT_VERSION = "1.5"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -717,6 +728,7 @@ def command_poll_loop(cfg: dict) -> None:
 
                 # Control commands — handled locally, no result needed
                 if cmd == "diag_start":
+                    global _diag_mode
                     _diag_mode = True
                     log.info("Diag mode ENABLED — polling every 5s")
                     post_result(cmd_id, cmd, {"status": "diag mode enabled", "poll_interval": _POLL_DIAG})
