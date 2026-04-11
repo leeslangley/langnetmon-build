@@ -28,16 +28,23 @@ from PIL import Image, ImageDraw
 # ── Paths & config ─────────────────────────────────────────────────────────
 
 _HERE = Path(__file__).parent
+CONFIG_PATH = _HERE / "config.json"
 LOG_PATH = _HERE / "netmon_agent.log"
 
-# Hardcoded for Langley home LAN — Mac Studio at 192.168.1.161
 DEFAULT_CONFIG = {
     "mac_ip": "192.168.1.161",
     "mac_port": 9876,
 }
 
-def load_config() -> dict:
-    return DEFAULT_CONFIG.copy()
+def load_config() -> dict:  # hardcoded for home LAN
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            logging.warning(f"Failed to load config: {e}")
+    return cfg
 
 # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -156,17 +163,53 @@ def gateway_ping_loop() -> None:
 # ── HTTP check ────────────────────────────────────────────────────────────
 
 def _http_check(url: str = "https://www.google.com") -> tuple[Optional[float], bool]:
+    """
+    HTTP check with explicit IPv4-only DNS to avoid Windows IPv6 fallback stall (~80s).
+    Logs DNS time separately for diagnostics.
+    """
+    import ssl
+    import http.client
+    import socket
+    from urllib.parse import urlparse
+
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "netmon-agent/1.0"})
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        # Force IPv4 DNS — avoids 80s stall from Windows trying IPv6 first
+        t_dns = time.monotonic()
+        try:
+            addr_infos = socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
+            ipv4 = addr_infos[0][4][0]
+        except Exception as e:
+            log.warning(f"HTTP DNS error for {hostname}: {e}")
+            return None, False
+        dns_ms = (time.monotonic() - t_dns) * 1000
+        log.debug(f"HTTP DNS: {hostname} -> {ipv4} in {dns_ms:.1f}ms")
+
         t0 = time.monotonic()
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return (time.monotonic() - t0) * 1000, resp.status == 200
+        if parsed.scheme == "https":
+            ctx = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(ipv4, port, timeout=10, context=ctx)
+            conn.set_tunnel(hostname)  # SNI + Host header
+        else:
+            conn = http.client.HTTPConnection(ipv4, port, timeout=10)
+
+        conn.request("GET", parsed.path or "/", headers={"Host": hostname, "User-Agent": "netmon-agent/1.0"})
+        resp = conn.getresponse()
+        latency = (time.monotonic() - t0) * 1000
+        ok = resp.status < 400
+        resp.read()  # drain
+        conn.close()
+        log.debug(f"HTTP: {'OK' if ok else 'FAIL'} {latency:.1f}ms (DNS {dns_ms:.1f}ms) status={resp.status}")
+        return latency, ok
     except Exception as e:
-        log.debug(f"HTTP check error: {e}")
+        log.warning(f"HTTP check error: {e}")
         return None, False
 
 def http_loop() -> None:
-    log.info("HTTP check loop started → google.com every 5s")
+    log.info("HTTP check loop started -> google.com every 5s (IPv4-forced)")
     while True:
         t0 = time.monotonic()
         try:
@@ -174,7 +217,7 @@ def http_loop() -> None:
             with state.lock:
                 state.http_latency_ms = latency
                 state.http_success = success
-            log.debug(f"HTTP: {'OK' if success else 'FAIL'} {latency}ms")
+            log.debug(f"HTTP result: {'OK' if success else 'FAIL'} {latency}ms")
         except Exception as e:
             log.error(f"HTTP loop error: {e}")
         time.sleep(max(0.0, 5.0 - (time.monotonic() - t0)))
