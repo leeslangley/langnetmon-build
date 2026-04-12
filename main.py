@@ -5,10 +5,12 @@ Monitors network health, displays a floating status window,
 and reports metrics to the Mac Studio daemon.
 """
 
+import http.client
 import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -590,7 +592,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.9.2"
+AGENT_VERSION = "1.9.3"
 
 
 def _check_for_update(cfg: dict) -> None:
