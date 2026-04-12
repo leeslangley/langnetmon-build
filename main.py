@@ -9,6 +9,7 @@ import http.client
 import json
 import logging
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -127,6 +128,101 @@ class _State:
         self.last_command_poll: datetime = datetime.now()  # tracks command poll loop timing
 
 state = _State()
+
+# ── Sysinfo ───────────────────────────────────────────────────────────────
+
+_START_TIME: float = time.time()   # module load time — used for uptime_hours
+_sysinfo: dict = {}                # populated at startup, refreshed every 60s
+
+
+def _collect_sysinfo() -> dict:
+    """Collect WiFi / network / system info. Always returns a dict; never raises."""
+    result: dict = {}
+    try:
+        result["hostname"] = socket.gethostname()
+    except Exception:
+        result["hostname"] = "unknown"
+    try:
+        result["ip_address"] = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        result["ip_address"] = None
+    try:
+        result["os_version"] = platform.version()
+    except Exception:
+        result["os_version"] = None
+    try:
+        result["uptime_hours"] = (time.time() - _START_TIME) / 3600.0
+    except Exception:
+        result["uptime_hours"] = None
+
+    # WiFi info via netsh
+    try:
+        proc = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        output = proc.stdout
+
+        def _field(name: str):
+            m = re.search(
+                rf"^\s*{re.escape(name)}\s*:\s*(.+)$", output,
+                re.MULTILINE | re.IGNORECASE,
+            )
+            return m.group(1).strip() if m else None
+
+        ssid         = _field("SSID")
+        bssid        = _field("BSSID")
+        signal       = _field("Signal")
+        radio_type   = _field("Radio type")
+        channel      = _field("Channel")
+        adapter_name = _field("Name")
+
+        if ssid:
+            result["connection_type"]  = "wifi"
+            result["wifi_ssid"]        = ssid
+            result["wifi_bssid"]       = bssid
+            result["wifi_radio_type"]  = radio_type
+            result["wifi_channel"]     = channel
+            result["adapter_name"]     = adapter_name
+            try:
+                result["wifi_signal_pct"] = int(signal.rstrip("%")) if signal else None
+            except Exception:
+                result["wifi_signal_pct"] = None
+        else:
+            result["connection_type"]  = "ethernet"
+            result["wifi_ssid"]        = None
+            result["wifi_bssid"]       = None
+            result["wifi_radio_type"]  = None
+            result["wifi_channel"]     = None
+            result["wifi_signal_pct"]  = None
+            result["adapter_name"]     = None
+    except Exception:
+        result["connection_type"]  = "unknown"
+        result["wifi_ssid"]        = None
+        result["wifi_bssid"]       = None
+        result["wifi_radio_type"]  = None
+        result["wifi_channel"]     = None
+        result["wifi_signal_pct"]  = None
+        result["adapter_name"]     = None
+
+    return result
+
+
+def _sysinfo_loop() -> None:
+    """Refresh _sysinfo every 60 seconds."""
+    global _sysinfo
+    while True:
+        try:
+            _sysinfo = _collect_sysinfo()
+            log.debug(
+                f"Sysinfo refreshed: type={_sysinfo.get('connection_type')} "
+                f"ssid={_sysinfo.get('wifi_ssid')} ip={_sysinfo.get('ip_address')}"
+            )
+        except Exception as e:
+            log.error(f"Sysinfo loop error: {e}")
+        time.sleep(60)
+
 
 # ── Color thresholds ─────────────────────────────────────────────────────
 
@@ -321,6 +417,7 @@ def report_loop(cfg: dict) -> None:
                 "http_latency_ms": http_lat,
                 "http_success": http_ok,
                 "timestamp": datetime.utcnow().isoformat(),
+                "sysinfo": dict(_sysinfo),
             }
             data = json.dumps(payload).encode("utf-8")
             # IPv4-forced POST — avoids Windows IPv6 stall
@@ -592,7 +689,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.9.3"
+AGENT_VERSION = "1.10.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -792,6 +889,10 @@ def _run_command(cmd: str, args: dict) -> dict:
                     "ping_ok": state.ping_success,
                     "gw_ok": state.gw_ping_success,
                 }
+
+        elif cmd == "sysinfo":
+            return dict(_sysinfo)
+
         else:
             return {"error": f"unknown command: {cmd}"}
 
@@ -1044,6 +1145,11 @@ def main() -> None:
     cfg = load_config()
     log.info(f"Mac target: {cfg['mac_ip']}:{cfg['mac_port']}")
 
+    # Collect sysinfo once at startup so first report has full data
+    global _sysinfo
+    _sysinfo = _collect_sysinfo()
+    log.info(f"Sysinfo: type={_sysinfo.get('connection_type')} ssid={_sysinfo.get('wifi_ssid')} ip={_sysinfo.get('ip_address')}")
+
     thread_specs = [
         ("ping",       ping_loop,         ()),
         ("gw-ping",    gateway_ping_loop,  ()),
@@ -1051,6 +1157,7 @@ def main() -> None:
         ("report",     report_loop,        (cfg,)),
         ("cmd-poll",   command_poll_loop,  (cfg,)),
         ("ps-session", ps_session_loop,    (cfg,)),
+        ("sysinfo",    _sysinfo_loop,      ()),
     ]
     live_threads = {name: _spawn_resilient(name, fn, args) for name, fn, args in thread_specs}
 
