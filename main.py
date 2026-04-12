@@ -206,6 +206,113 @@ def _collect_sysinfo() -> dict:
         result["wifi_signal_pct"]  = None
         result["adapter_name"]     = None
 
+    # DNS resolution latency
+    try:
+        import time as _time
+        _t0 = _time.time()
+        socket.getaddrinfo("google.com", 80)
+        result["dns_latency_ms"] = round((_time.time() - _t0) * 1000, 1)
+    except Exception:
+        result["dns_latency_ms"] = None
+
+    # Adapter link speed via WMIC (works for both WiFi and ethernet)
+    try:
+        proc2 = subprocess.run(
+            ["wmic", "nic", "where", "NetEnabled=true", "get", "Name,Speed,MACAddress", "/format:csv"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        best_speed = None
+        best_mac = None
+        for line in proc2.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("Node"):
+                continue
+            parts = line.split(",")
+            if len(parts) >= 4:
+                mac_addr = parts[1].strip()
+                name_val = parts[2].strip()
+                speed_val = parts[3].strip()
+                if speed_val and speed_val.isdigit() and int(speed_val) > 0:
+                    spd_mbps = int(speed_val) // 1_000_000
+                    if best_speed is None or spd_mbps > best_speed:
+                        best_speed = spd_mbps
+                        best_mac = mac_addr
+        result["link_speed_mbps"] = best_speed
+        result["mac_address"] = best_mac
+    except Exception:
+        result["link_speed_mbps"] = None
+        result["mac_address"] = None
+
+    # Gateway MAC from ARP table — detects DHCP flap or evil-twin changes
+    try:
+        proc3 = subprocess.run(
+            ["arp", "-a", GATEWAY_HOST],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        gw_mac = None
+        for line in proc3.stdout.splitlines():
+            if GATEWAY_HOST in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    gw_mac = parts[1]
+                    break
+        result["gateway_mac"] = gw_mac
+    except Exception:
+        result["gateway_mac"] = None
+
+    # CPU and RAM usage
+    try:
+        # CPU: wmic cpu get LoadPercentage
+        proc4 = subprocess.run(
+            ["wmic", "cpu", "get", "LoadPercentage", "/format:value"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        cpu_pct = None
+        for line in proc4.stdout.splitlines():
+            if "LoadPercentage=" in line:
+                val = line.split("=", 1)[1].strip()
+                if val.isdigit():
+                    cpu_pct = int(val)
+                    break
+        result["cpu_pct"] = cpu_pct
+    except Exception:
+        result["cpu_pct"] = None
+
+    try:
+        # RAM: wmic OS get FreePhysicalMemory,TotalVisibleMemorySize
+        proc5 = subprocess.run(
+            ["wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/format:csv"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        ram_free_mb = None
+        ram_total_mb = None
+        for line in proc5.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("Node"):
+                continue
+            parts = line.split(",")
+            if len(parts) >= 3:
+                try:
+                    ram_free_mb = int(parts[1].strip()) // 1024
+                    ram_total_mb = int(parts[2].strip()) // 1024
+                except (ValueError, IndexError):
+                    pass
+                break
+        result["ram_free_mb"] = ram_free_mb
+        result["ram_total_mb"] = ram_total_mb
+        if ram_total_mb and ram_free_mb is not None:
+            result["ram_used_pct"] = round((1 - ram_free_mb / ram_total_mb) * 100, 1)
+        else:
+            result["ram_used_pct"] = None
+    except Exception:
+        result["ram_free_mb"] = None
+        result["ram_total_mb"] = None
+        result["ram_used_pct"] = None
+
     return result
 
 
@@ -689,7 +796,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.10.0"
+AGENT_VERSION = "1.12.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -728,6 +835,9 @@ def _mac_http_get_ipv4(mac_ip: str, mac_port: int, path: str, timeout: int = 10)
     return data
 
 
+_UPDATE_DONE_THIS_SESSION: bool = False  # guard against update loops
+
+
 def _do_update_check(cfg: dict) -> bool:
     """
     Check the Mac daemon for a newer agent version and self-update if found.
@@ -736,6 +846,11 @@ def _do_update_check(cfg: dict) -> bool:
     """
     if not getattr(sys, "frozen", False):
         log.debug("Auto-update: skipped (not frozen exe)")
+        return False
+
+    global _UPDATE_DONE_THIS_SESSION
+    if _UPDATE_DONE_THIS_SESSION:
+        log.debug("Auto-update: already ran this session, skipping")
         return False
 
     import tempfile
@@ -777,20 +892,21 @@ def _do_update_check(cfg: dict) -> bool:
         )
         bat.write(
             f"@echo off\r\n"
-            f"timeout /t 3 /nobreak >nul\r\n"
-            f"copy /Y \"{tmp.name}\" \"{current_exe}\"\r\n"
-            f"del \"{tmp.name}\"\r\n"
-            f"start \"\" \"{current_exe}\"\r\n"
-            f"del \"%~f0\"\r\n"
+            f"timeout /t 3 /nobreak >nul 2>&1\r\n"
+            f"copy /Y \"{tmp.name}\" \"{current_exe}\" >nul 2>&1\r\n"
+            f"del \"{tmp.name}\" >nul 2>&1\r\n"
+            f"start /min \"\" \"{current_exe}\"\r\n"
+            f"(del \"%~f0\") >nul 2>&1\r\n"
         )
         bat.close()
 
         subprocess.Popen(
             ["cmd", "/c", bat.name],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
         log.info(f"Auto-update: v{remote_version} launcher started, exiting")
+        _UPDATE_DONE_THIS_SESSION = True
         os._exit(0)
 
     except Exception as e:
@@ -801,6 +917,22 @@ def _do_update_check(cfg: dict) -> bool:
 # ── Command poll (outbound-only diagnostics) ──────────────────────────────
 # Agent polls Mac for pending commands every 30s. No inbound ports opened.
 # Supported commands: dns, tcp, http, ping, tracert, ipconfig, state
+
+_SHELL_WHITELIST = [
+    "get-netadapter", "get-netipaddress", "get-netroute", "get-nettcpconnection",
+    "get-dnsclient", "get-dnsclientcache", "clear-dnsclientcache",
+    "get-netconnectionprofile", "get-wifisignal", "netsh wlan",
+    "test-netconnection", "test-connection", "resolve-dnsname",
+    "get-process", "get-service", "get-eventlog",
+    "ipconfig", "arp", "route", "nslookup", "tracert", "ping",
+    "get-childitem", "get-item", "get-content",
+    "get-wmiobject win32_networkadapter", "get-wmiobject win32_computersystem",
+    "get-computerinfo", "systeminfo",
+    "get-volume", "get-disk", "get-physicaldisk",
+    "get-counter", "get-date", "get-uptime",
+    "whoami", "hostname", "ver",
+]
+
 
 def _run_command(cmd: str, args: dict) -> dict:
     import subprocess, socket, ssl, http.client, time
@@ -892,6 +1024,37 @@ def _run_command(cmd: str, args: dict) -> dict:
 
         elif cmd == "sysinfo":
             return dict(_sysinfo)
+
+        elif cmd == "shell":
+            ps_cmd = args.get("cmd", "").strip()
+            if not ps_cmd:
+                return {"error": "no command provided"}
+
+            # Whitelist check — case-insensitive prefix match
+            ps_lower = ps_cmd.lower().strip()
+            allowed = any(ps_lower.startswith(w) for w in _SHELL_WHITELIST)
+            if not allowed:
+                return {
+                    "error": f"command not in whitelist: {ps_cmd[:80]}",
+                    "allowed": _SHELL_WHITELIST,
+                }
+
+            try:
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                     "-Command", ps_cmd],
+                    capture_output=True, text=True, timeout=30,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return {
+                    "stdout": proc.stdout.strip(),
+                    "stderr": proc.stderr.strip(),
+                    "returncode": proc.returncode,
+                }
+            except subprocess.TimeoutExpired:
+                return {"error": "command timed out after 30s"}
+            except Exception as e:
+                return {"error": str(e)}
 
         else:
             return {"error": f"unknown command: {cmd}"}
@@ -1070,12 +1233,9 @@ def command_poll_loop(cfg: dict) -> None:
         }).encode()
         _ipv4_post(result_path, payload)
 
-    # Startup update check — retry until Mac is reachable (don't give up)
+    # Startup update check — single attempt only to avoid update loops
     log.info("Auto-update: checking on startup...")
-    for _attempt in range(10):  # up to 10 retries, 5s apart
-        if _do_update_check(cfg):  # returns True only if update triggered (exits)
-            break
-        time.sleep(5)
+    _do_update_check(cfg)  # exits process if update triggered
 
     while True:
         interval = _POLL_DIAG if _diag_mode else _POLL_NORMAL
