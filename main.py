@@ -77,8 +77,9 @@ from PIL import Image, ImageDraw
 
 # ── Paths & config ─────────────────────────────────────────────────────────
 
-_HERE = Path(__file__).parent
-CONFIG_PATH = _HERE / "config.json"
+# Use the exe's own directory (works in both PyInstaller frozen and dev mode)
+_HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+CONFIG_PATH = _HERE / "netmon_config.json"
 LOG_PATH = _HERE / "netmon_agent.log"
 
 DEFAULT_CONFIG = {
@@ -589,7 +590,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.9.1"
+AGENT_VERSION = "1.9.2"
 
 
 def _check_for_update(cfg: dict) -> None:
