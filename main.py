@@ -155,6 +155,10 @@ class _State:
         self.gateway_ping_results: deque[dict] = deque(maxlen=5)
         self.http_latency_ms: Optional[float] = None
         self.http_success: bool = False
+        # Per-URL HTTP probe results (url -> {latency_ms, success, ts})
+        self.http_results: dict = {}
+        # Dynamic probe URL list fetched from the Mac daemon
+        self.http_probe_urls: list = ["https://www.google.com"]
         self.mac_reachable: bool = False
         self.mac_fail_since: Optional[datetime] = None  # when consecutive failures started
         self.last_update: datetime = datetime.now()
@@ -498,16 +502,59 @@ def _http_check(url: str = "https://www.google.com") -> tuple[Optional[float], b
         log.warning(f"HTTP check error: {e}")
         return None, False
 
-def http_loop() -> None:
-    log.info("HTTP check loop started -> google.com every 5s (IPv4-forced)")
+def _fetch_probe_urls(cfg: dict) -> Optional[list]:
+    """Fetch the live probe URL list from the Mac daemon. Returns None on failure."""
+    try:
+        raw = _mac_http_get_ipv4(cfg["mac_ip"], int(cfg["mac_port"]), "/api/probes/config", timeout=5)
+        payload = json.loads(raw.decode("utf-8", errors="replace"))
+        urls = payload.get("probes") or []
+        if isinstance(urls, list) and all(isinstance(u, str) for u in urls) and urls:
+            return urls
+        log.warning(f"Probe config returned unexpected payload: {payload}")
+    except Exception as e:
+        log.warning(f"Probe config fetch error: {e}")
+    return None
+
+
+def http_loop(cfg: dict) -> None:
+    """Loop over the probes returned by the daemon. Refreshes hourly.
+    Falls back to google.com if the config endpoint is unreachable."""
+    log.info("HTTP check loop started — dynamic probes from daemon (IPv4-forced)")
+    urls: list = ["https://www.google.com"]
+    last_fetch = 0.0
+    first_fetch_done = False
     while True:
         t0 = time.monotonic()
         try:
-            latency, success = _http_check()
+            # Fetch probe list on startup, then every hour
+            if (not first_fetch_done) or (t0 - last_fetch > 3600):
+                fetched = _fetch_probe_urls(cfg)
+                if fetched:
+                    urls = fetched
+                    log.info(f"HTTP probe URLs refreshed: {urls}")
+                elif not first_fetch_done:
+                    log.warning("Probe config unreachable — falling back to https://www.google.com only")
+                last_fetch = t0
+                first_fetch_done = True
+
+            results_this_round: dict = {}
+            primary_latency: Optional[float] = None
+            primary_ok: bool = False
+            for i, url in enumerate(urls):
+                latency, ok = _http_check(url)
+                ts = datetime.utcnow().isoformat()
+                results_this_round[url] = {"latency_ms": latency, "success": ok, "ts": ts}
+                if i == 0:
+                    primary_latency = latency
+                    primary_ok = ok
+                log.debug(f"HTTP {url}: {'OK' if ok else 'FAIL'} {latency}ms")
+
             with state.lock:
-                state.http_latency_ms = latency
-                state.http_success = success
-            log.debug(f"HTTP result: {'OK' if success else 'FAIL'} {latency}ms")
+                state.http_results = results_this_round
+                state.http_probe_urls = list(urls)
+                # Preserve legacy single-probe fields for any callers still reading them
+                state.http_latency_ms = primary_latency
+                state.http_success = primary_ok
         except Exception as e:
             log.error(f"HTTP loop error: {e}")
         time.sleep(max(0.0, 5.0 - (time.monotonic() - t0)))
@@ -527,6 +574,8 @@ def report_loop(cfg: dict) -> None:
                 gw_results = list(state.gateway_ping_results)
                 http_lat = state.http_latency_ms
                 http_ok = state.http_success
+                http_results_snapshot = dict(state.http_results)
+                probe_urls_snapshot = list(state.http_probe_urls)
 
             lats = [r["latency_ms"] for r in results if r["success"] and r["latency_ms"] is not None]
             avg_ping = sum(lats) / len(lats) if lats else None
@@ -545,6 +594,8 @@ def report_loop(cfg: dict) -> None:
                 "gateway_ping_success": gw_ping_ok,
                 "http_latency_ms": http_lat,
                 "http_success": http_ok,
+                "http_results": http_results_snapshot,
+                "http_probes": probe_urls_snapshot,
                 "timestamp": datetime.utcnow().isoformat(),
                 "sysinfo": dict(_sysinfo),
             }
@@ -818,7 +869,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.2.2"
+AGENT_VERSION = "2.3.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1686,7 +1737,7 @@ def main() -> None:
     thread_specs = [
         ("ping",       ping_loop,         ()),
         ("gw-ping",    gateway_ping_loop,  ()),
-        ("http",       http_loop,          ()),
+        ("http",       http_loop,          (cfg,)),
         ("report",     report_loop,        (cfg,)),
         ("cmd-poll",   command_poll_loop,  (cfg,)),
         ("ps-session", ps_session_loop,    (cfg,)),
