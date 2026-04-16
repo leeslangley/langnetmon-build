@@ -197,7 +197,7 @@ def _collect_sysinfo() -> dict:
              "$p = Get-NetConnectionProfile | Select-Object -First 1; "
              "$n = if($p){Get-NetAdapter -InterfaceIndex $p.InterfaceIndex -ErrorAction SilentlyContinue}; "
              "$r = @{}; "
-             "if($p -and $n -and $n.MediaType -eq '802.11'){"
+             "if($p -and $n -and $n.MediaType -match '802.11'){"
              "$r['connection_type']='wifi'; "
              "$r['wifi_ssid']=$p.Name; "
              "$r['wifi_radio_type']=$n.MediaType; "
@@ -223,7 +223,7 @@ def _collect_sysinfo() -> dict:
             wifi_data = json.loads(proc.stdout.strip())
             if isinstance(wifi_data, dict):
                 result.update(wifi_data)
-        if not result.get("wifi_ssid"):
+        if not result.get("wifi_ssid") and result.get("connection_type") != "wifi":
             result["connection_type"] = "ethernet"
             for k in ["wifi_ssid","wifi_bssid","wifi_radio_type","wifi_channel","wifi_signal_pct","adapter_name"]:
                 result.setdefault(k, None)
@@ -290,44 +290,40 @@ def _collect_sysinfo() -> dict:
 
     # CPU and RAM usage
     try:
-        # CPU: wmic cpu get LoadPercentage
+        # CPU: PowerShell CIM (wmic is deprecated in newer Windows)
         proc4 = subprocess.run(
-            ["wmic", "cpu", "get", "LoadPercentage", "/format:value"],
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command", "(Get-CimInstance Win32_Processor).LoadPercentage"],
             capture_output=True, text=True, timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         cpu_pct = None
-        for line in proc4.stdout.splitlines():
-            if "LoadPercentage=" in line:
-                val = line.split("=", 1)[1].strip()
-                if val.isdigit():
-                    cpu_pct = int(val)
-                    break
+        val = proc4.stdout.strip()
+        if val.isdigit():
+            cpu_pct = int(val)
         result["cpu_pct"] = cpu_pct
     except Exception:
         result["cpu_pct"] = None
 
     try:
-        # RAM: wmic OS get FreePhysicalMemory,TotalVisibleMemorySize
+        # RAM: PowerShell CIM (wmic is deprecated in newer Windows)
         proc5 = subprocess.run(
-            ["wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/format:csv"],
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command",
+             "$os = Get-CimInstance Win32_OperatingSystem; "
+             "\"$($os.FreePhysicalMemory),$($os.TotalVisibleMemorySize)\""],
             capture_output=True, text=True, timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
         ram_free_mb = None
         ram_total_mb = None
-        for line in proc5.stdout.splitlines():
-            line = line.strip()
-            if not line or line.startswith("Node"):
-                continue
-            parts = line.split(",")
-            if len(parts) >= 3:
-                try:
-                    ram_free_mb = int(parts[1].strip()) // 1024
-                    ram_total_mb = int(parts[2].strip()) // 1024
-                except (ValueError, IndexError):
-                    pass
-                break
+        parts = proc5.stdout.strip().split(",")
+        if len(parts) == 2:
+            try:
+                ram_free_mb = int(parts[0].strip()) // 1024
+                ram_total_mb = int(parts[1].strip()) // 1024
+            except (ValueError, IndexError):
+                pass
         result["ram_free_mb"] = ram_free_mb
         result["ram_total_mb"] = ram_total_mb
         if ram_total_mb and ram_free_mb is not None:
@@ -822,7 +818,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.2.1"
+AGENT_VERSION = "2.2.2"
 
 
 def _check_for_update(cfg: dict) -> None:
