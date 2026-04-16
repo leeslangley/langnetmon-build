@@ -167,6 +167,18 @@ class _State:
 
 state = _State()
 
+# ── Internet-down state tracker ───────────────────────────────────────────
+_internet_state: dict = {
+    "down": False,
+    "consecutive_failures": 0,
+    "last_notified": 0.0,
+    "down_since": 0.0,
+}
+
+# Module-level tray icon reference — set by NetMonWindow._run_tray so that
+# report_loop (which runs in a background thread) can fire toast notifications.
+_tray_icon: Optional[pystray.Icon] = None
+
 # ── Sysinfo ───────────────────────────────────────────────────────────────
 
 _START_TIME: float = time.time()   # module load time — used for uptime_hours
@@ -559,6 +571,22 @@ def http_loop(cfg: dict) -> None:
             log.error(f"HTTP loop error: {e}")
         time.sleep(max(0.0, 5.0 - (time.monotonic() - t0)))
 
+# ── Internet-down notification helper ────────────────────────────────────
+
+def _notify_user(title: str, body: str) -> None:
+    """Fire a pystray toast if the tray icon is running; fall back to log only.
+    Anti-spam: silently drops calls made within 60 s of the last notification."""
+    now = time.time()
+    if now - _internet_state["last_notified"] < 60:
+        return
+    _internet_state["last_notified"] = now
+    try:
+        if _tray_icon:
+            _tray_icon.notify(body, title=title)
+    except Exception:
+        pass
+
+
 # ── Report to Mac ─────────────────────────────────────────────────────────
 
 def report_loop(cfg: dict) -> None:
@@ -584,6 +612,41 @@ def report_loop(cfg: dict) -> None:
             gw_lats = [r["latency_ms"] for r in gw_results if r["success"] and r["latency_ms"] is not None]
             avg_gw_ping = sum(gw_lats) / len(gw_lats) if gw_lats else None
             gw_ping_ok = any(r["success"] for r in gw_results) if gw_results else False
+
+            # ── Local internet-down detection ─────────────────────────────
+            # Requires BOTH WAN ping (8.8.8.8) AND at least one HTTP probe
+            # to fail before counting toward the outage threshold.
+            _now = time.time()
+            any_http_failed = not http_ok or any(
+                not v.get("success", True) for v in http_results_snapshot.values()
+            ) if http_results_snapshot else not http_ok
+
+            if not ping_ok and any_http_failed:
+                _internet_state["consecutive_failures"] += 1
+            else:
+                if _internet_state["down"]:
+                    # Internet just recovered
+                    minutes = max(1, round((_now - _internet_state["down_since"]) / 60))
+                    _notify_user(
+                        "\u2713 Internet Restored",
+                        f"WAN and HTTP connectivity recovered after "
+                        f"{minutes} minute{'s' if minutes != 1 else ''}.",
+                    )
+                    log.info("Internet RESTORED after outage")
+                _internet_state["consecutive_failures"] = 0
+                _internet_state["down"] = False
+
+            if _internet_state["consecutive_failures"] >= 3 and not _internet_state["down"]:
+                _internet_state["down"] = True
+                _internet_state["down_since"] = _now
+                gw_status = "reachable" if gw_ping_ok else "unreachable"
+                _notify_user(
+                    "\u26a0 Internet Down",
+                    f"WAN ping and HTTP probes failing. "
+                    f"Gateway is {gw_status}. Check your connection.",
+                )
+                log.warning("Internet DOWN: WAN ping and HTTP probes both failing")
+            # ── End internet-down detection ───────────────────────────────
 
             payload = {
                 "hostname": os.environ.get("COMPUTERNAME", "windows-agent"),
@@ -785,6 +848,7 @@ class NetMonWindow:
     # ── Tray ──────────────────────────────────────────────────────────────
 
     def _run_tray(self):
+        global _tray_icon
         menu = pystray.Menu(
             pystray.MenuItem("Show",  self._show_window, default=True),
             pystray.MenuItem("Hide",  self._hide_window),
@@ -797,6 +861,7 @@ class NetMonWindow:
             f"LangNetmon v{AGENT_VERSION}",
             menu=menu,
         )
+        _tray_icon = self._tray_icon  # expose to module-level for background threads
         self._tray_icon.run()
 
     # ── Update loop ───────────────────────────────────────────────────────
@@ -869,7 +934,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.3.0"
+AGENT_VERSION = "2.3.1"
 
 
 def _check_for_update(cfg: dict) -> None:
