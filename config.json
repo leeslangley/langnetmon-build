@@ -1,4 +1,12 @@
 {
   "mac_ip": "192.168.1.161",
-  "mac_port": 9876
+  "mac_port": 9876,
+  "sync_enabled_hosts": ["LLANGLEY-CHILLB", "LLANGLEY16"],
+  "sync_paths": {
+    "old-cylance": "C:\\Users\\leesl\\Documents\\Old Cylance",
+    "wow-addons":  "C:\\Program Files (x86)\\World of Warcraft\\_retail_\\Interface\\Addons",
+    "wow-wtf":     "C:\\Program Files (x86)\\World of Warcraft\\_retail_\\WTF"
+  },
+  "sync_exclusions": ["config.wtf"],
+  "sync_interval_seconds": 3600
 }

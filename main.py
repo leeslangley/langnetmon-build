@@ -93,10 +93,43 @@ DEFAULT_CONFIG = {
 MAC_IP   = "192.168.1.161"  # always use this — ignore any saved config
 MAC_PORT = 9876
 
+# ── Sync config (Task 3 — LLANGLEY-CHILLB + LLANGLEY16 only) ──────────────
+# Folder sync is gated by hostname. Defence-in-depth: config.wtf is hardcoded
+# in the exclusion list AND checked explicitly before upload.
+SYNC_ENABLED_HOSTS = ["LLANGLEY-CHILLB", "LLANGLEY16"]
+
+SYNC_PATHS = {
+    "old-cylance": r"C:\Users\leesl\Documents\Old Cylance",
+    "wow-addons":  r"C:\Program Files (x86)\World of Warcraft\_retail_\Interface\Addons",
+    "wow-wtf":     r"C:\Program Files (x86)\World of Warcraft\_retail_\WTF",
+}
+
+# HARD EXCLUSION — per-machine graphics settings. Never sync.
+SYNC_EXCLUSIONS = ["config.wtf"]
+SYNC_INTERVAL_SECONDS = 3600
+
 def load_config() -> dict:
     """Always return the hardcoded defaults. Config file is ignored for mac_ip/mac_port
-    to avoid stale configs on reinstall breaking connectivity."""
-    return {"mac_ip": MAC_IP, "mac_port": MAC_PORT}
+    to avoid stale configs on reinstall breaking connectivity. Sync config is
+    merged from netmon_config.json if present (not critical if missing)."""
+    cfg = {
+        "mac_ip": MAC_IP,
+        "mac_port": MAC_PORT,
+        "sync_enabled_hosts": SYNC_ENABLED_HOSTS,
+        "sync_paths": dict(SYNC_PATHS),
+        "sync_exclusions": list(SYNC_EXCLUSIONS),
+        "sync_interval_seconds": SYNC_INTERVAL_SECONDS,
+    }
+    try:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            for k in ("sync_enabled_hosts", "sync_paths", "sync_exclusions", "sync_interval_seconds"):
+                if k in user:
+                    cfg[k] = user[k]
+    except Exception:
+        pass
+    return cfg
 
 # ── Logging ───────────────────────────────────────────────────────────────
 
@@ -126,6 +159,7 @@ class _State:
         self.mac_fail_since: Optional[datetime] = None  # when consecutive failures started
         self.last_update: datetime = datetime.now()
         self.last_command_poll: datetime = datetime.now()  # tracks command poll loop timing
+        self._shell_active_count: int = 0  # concurrency guard for shell commands
 
 state = _State()
 
@@ -155,56 +189,48 @@ def _collect_sysinfo() -> dict:
     except Exception:
         result["uptime_hours"] = None
 
-    # WiFi info via netsh
+    # WiFi info via PowerShell WMI (avoids netsh which triggers Windows Location Services icon)
     try:
         proc = subprocess.run(
-            ["netsh", "wlan", "show", "interfaces"],
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command",
+             "$p = Get-NetConnectionProfile | Select-Object -First 1; "
+             "$n = if($p){Get-NetAdapter -InterfaceIndex $p.InterfaceIndex -ErrorAction SilentlyContinue}; "
+             "$r = @{}; "
+             "if($p -and $n -and $n.MediaType -eq '802.11'){"
+             "$r['connection_type']='wifi'; "
+             "$r['wifi_ssid']=$p.Name; "
+             "$r['wifi_radio_type']=$n.MediaType; "
+             "$r['adapter_name']=$n.Name; "
+             "$r['wifi_channel']=$null; "
+             "$r['wifi_bssid']=$null; "
+             "$sig = netsh wlan show interfaces 2>$null | Select-String 'Signal'; "
+             "if($sig){try{$r['wifi_signal_pct']=[int](($sig -replace '\D',''))}catch{$r['wifi_signal_pct']=$null}}else{$r['wifi_signal_pct']=$null}"
+             "}else{"
+             "$r['connection_type']='ethernet'; "
+             "$r['wifi_ssid']=$null; "
+             "$r['wifi_bssid']=$null; "
+             "$r['wifi_radio_type']=$null; "
+             "$r['wifi_channel']=$null; "
+             "$r['wifi_signal_pct']=$null; "
+             "$r['adapter_name']=if($n){$n.Name}else{$null}"
+             "}; "
+             "$r | ConvertTo-Json"],
             capture_output=True, text=True, timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        output = proc.stdout
-
-        def _field(name: str):
-            m = re.search(
-                rf"^\s*{re.escape(name)}\s*:\s*(.+)$", output,
-                re.MULTILINE | re.IGNORECASE,
-            )
-            return m.group(1).strip() if m else None
-
-        ssid         = _field("SSID")
-        bssid        = _field("BSSID")
-        signal       = _field("Signal")
-        radio_type   = _field("Radio type")
-        channel      = _field("Channel")
-        adapter_name = _field("Name")
-
-        if ssid:
-            result["connection_type"]  = "wifi"
-            result["wifi_ssid"]        = ssid
-            result["wifi_bssid"]       = bssid
-            result["wifi_radio_type"]  = radio_type
-            result["wifi_channel"]     = channel
-            result["adapter_name"]     = adapter_name
-            try:
-                result["wifi_signal_pct"] = int(signal.rstrip("%")) if signal else None
-            except Exception:
-                result["wifi_signal_pct"] = None
-        else:
-            result["connection_type"]  = "ethernet"
-            result["wifi_ssid"]        = None
-            result["wifi_bssid"]       = None
-            result["wifi_radio_type"]  = None
-            result["wifi_channel"]     = None
-            result["wifi_signal_pct"]  = None
-            result["adapter_name"]     = None
+        if proc.stdout.strip():
+            wifi_data = json.loads(proc.stdout.strip())
+            if isinstance(wifi_data, dict):
+                result.update(wifi_data)
+        if not result.get("wifi_ssid"):
+            result["connection_type"] = "ethernet"
+            for k in ["wifi_ssid","wifi_bssid","wifi_radio_type","wifi_channel","wifi_signal_pct","adapter_name"]:
+                result.setdefault(k, None)
     except Exception:
         result["connection_type"]  = "unknown"
-        result["wifi_ssid"]        = None
-        result["wifi_bssid"]       = None
-        result["wifi_radio_type"]  = None
-        result["wifi_channel"]     = None
-        result["wifi_signal_pct"]  = None
-        result["adapter_name"]     = None
+        for k in ["wifi_ssid","wifi_bssid","wifi_radio_type","wifi_channel","wifi_signal_pct","adapter_name"]:
+            result[k] = None
 
     # DNS resolution latency
     try:
@@ -599,9 +625,9 @@ def _make_dot_image(hex_color: str, size: int = 64) -> Image.Image:
 
 # ── GUI ───────────────────────────────────────────────────────────────────
 
-_BG = "#1e1e1e"
-_FG_DIM = "#888888"
-_FG_LABEL = "#aaaaaa"
+_BG = "#26215C"  # Langley Inc brand
+_FG_DIM = "#a0a0c0"
+_FG_LABEL = "#c0c0d8"
 _INDICATOR_PX = 20
 _FONT_SMALL = ("Segoe UI", 9)
 _FONT_LABEL = ("Segoe UI", 9, "bold")
@@ -611,8 +637,8 @@ class NetMonWindow:
         self.root = root
         import socket as _s
         _hostname = _s.gethostname()
-        self.root.title(f"LangNetmon v{AGENT_VERSION} — {_hostname}")
-        self.root.geometry("300x115")
+        self.root.title(f"LangNetmon v{AGENT_VERSION} — {_hostname} · Langley Inc")
+        self.root.geometry("300x120")
         self.root.resizable(False, False)
         self.root.configure(bg=_BG)
         self.root.attributes("-topmost", True)
@@ -796,7 +822,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "1.12.0"
+AGENT_VERSION = "2.0.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -933,6 +959,29 @@ _SHELL_WHITELIST = [
     "whoami", "hostname", "ver",
 ]
 
+# Blocked patterns — always rejected even if whitelist prefix matches
+_SHELL_BLOCKED_PATTERNS = [
+    r"\b(remove|delete|rm|del|format|erase)\b",
+    r"\b(stop-service|restart-service|disable-service)\b",
+    r"\b(net\s+stop|net\s+user|net\s+localgroup)\b",
+    r"\b(reg\s+delete|reg\s+add)\b",
+    r"\b(taskkill|kill)\b",
+    r"\b(Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\s+.*-OutFile",
+    r"\b(Set-ExecutionPolicy)\b",
+    r"\b(Start-Process)\b",
+    r"\b(Out-File|Set-Content|Add-Content)[^|]*\b(C:\\|\\\\)\b",
+    r"\b(New-Item)\s+.*-ItemType\s+(Directory|File)",
+    r"\b(Invoke-Expression|iex)\b",
+    r"\|\s*Out-File",
+    r">>",
+    r">",
+]
+
+_SHELL_MAX_CMD_LEN = 500
+_SHELL_MAX_CONCURRENT = 2
+_SHELL_TIMEOUT_SECONDS = 30
+_SHELL_DRY_RUN_ENABLED = True
+
 
 def _run_command(cmd: str, args: dict) -> dict:
     import subprocess, socket, ssl, http.client, time
@@ -1030,6 +1079,10 @@ def _run_command(cmd: str, args: dict) -> dict:
             if not ps_cmd:
                 return {"error": "no command provided"}
 
+            # Length limit
+            if len(ps_cmd) > _SHELL_MAX_CMD_LEN:
+                return {"error": f"command too long ({len(ps_cmd)} chars, max {_SHELL_MAX_CMD_LEN})"}
+
             # Whitelist check — case-insensitive prefix match
             ps_lower = ps_cmd.lower().strip()
             allowed = any(ps_lower.startswith(w) for w in _SHELL_WHITELIST)
@@ -1039,22 +1092,60 @@ def _run_command(cmd: str, args: dict) -> dict:
                     "allowed": _SHELL_WHITELIST,
                 }
 
+            # Blocked pattern check — catch destructive commands even if whitelist matches
+            import re as _re
+            for pattern in _SHELL_BLOCKED_PATTERNS:
+                if _re.search(pattern, ps_lower):
+                    return {
+                        "error": f"command blocked by safety pattern: {ps_cmd[:80]}",
+                        "blocked_pattern": pattern,
+                    }
+
+            # Concurrency guard
+            with state.lock:
+                active = getattr(state, '_shell_active_count', 0)
+                if active >= _SHELL_MAX_CONCURRENT:
+                    return {"error": f"too many concurrent shell commands ({active} running, max {_SHELL_MAX_CONCURRENT})"}
+                state._shell_active_count = active + 1
+
             try:
+                # Dry-run mode: parse the command without executing to verify syntax
+                if _SHELL_DRY_RUN_ENABLED:
+                    try:
+                        dry_proc = subprocess.run(
+                            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                             "-Command", f"[scriptblock]::Create({json.dumps(ps_cmd)}) | Out-Null"],
+                            capture_output=True, text=True, timeout=10,
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                        )
+                        if dry_proc.returncode != 0 and "ParseException" in dry_proc.stderr:
+                            return {"error": f"syntax error in command: {dry_proc.stderr[:200]}"}
+                    except subprocess.TimeoutExpired:
+                        pass  # dry-run timeout is ok, proceed to real exec
+                    except Exception:
+                        pass  # dry-run failure is non-fatal
+
                 proc = subprocess.run(
                     ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                      "-Command", ps_cmd],
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, timeout=_SHELL_TIMEOUT_SECONDS,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
+                # Truncate output to prevent memory issues
+                stdout = proc.stdout.strip()[:50000]
+                stderr = proc.stderr.strip()[:10000]
                 return {
-                    "stdout": proc.stdout.strip(),
-                    "stderr": proc.stderr.strip(),
+                    "stdout": stdout,
+                    "stderr": stderr,
                     "returncode": proc.returncode,
                 }
             except subprocess.TimeoutExpired:
-                return {"error": "command timed out after 30s"}
+                return {"error": f"command timed out after {_SHELL_TIMEOUT_SECONDS}s"}
             except Exception as e:
                 return {"error": str(e)}
+            finally:
+                with state.lock:
+                    state._shell_active_count = max(0, getattr(state, '_shell_active_count', 1) - 1)
 
         else:
             return {"error": f"unknown command: {cmd}"}
@@ -1079,6 +1170,18 @@ _POLL_DIAG    = 5    # seconds between polls in diag mode
 
 def _run_ps(script: str) -> tuple[str, str, int]:
     """Run a PowerShell script, return (stdout, stderr, exit_code)."""
+    # Safety: reject overly long scripts
+    if len(script) > 5000:
+        return "", f"Script too long ({len(script)} chars, max 5000)", 1
+    # Safety: reject destructive patterns
+    import re as _re
+    _PS_BLOCKED = [r"\b(Remove-Item|del|rm|erase)\b", r"\b(Stop-Service|Restart-Service)\b",
+                   r"\b(taskkill)\b", r"\b(Invoke-Expression|iex)\b", r"\b(format)\b",
+                   r"\b(Start-Process)\b", r">>"]
+    script_lower = script.lower()
+    for pat in _PS_BLOCKED:
+        if _re.search(pat, script_lower):
+            return "", f"Script blocked by safety pattern: {pat}", 1
     try:
         result = subprocess.run(
             [
@@ -1093,7 +1196,10 @@ def _run_ps(script: str) -> tuple[str, str, int]:
             timeout=60,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        return result.stdout, result.stderr, result.returncode
+        # Truncate output
+        stdout = result.stdout[:50000]
+        stderr = result.stderr[:10000]
+        return stdout, stderr, result.returncode
     except subprocess.TimeoutExpired:
         return "", "PowerShell execution timed out (60s)", 1
     except Exception as e:
@@ -1283,6 +1389,198 @@ def command_poll_loop(cfg: dict) -> None:
             log.debug(f"Command poll error: {e}")
 
 
+# ── Folder sync (Task 3 — gated by hostname) ──────────────────────────────
+# Walks configured sync roots hourly, builds a SHA-256 + mtime + size
+# manifest, exchanges directives with the Mac daemon, and uploads/downloads
+# newer files. HARD EXCLUSION: config.wtf is never uploaded — it's per-machine
+# graphics settings and mixing them corrupts clients.
+
+def _sync_is_excluded(rel_path: str, exclusions: list) -> bool:
+    """True if the file should never be synced. Defence in depth."""
+    name = os.path.basename(rel_path).lower()
+    if name == "config.wtf":
+        return True
+    for ex in exclusions or []:
+        if name == ex.lower() or rel_path.lower().endswith(ex.lower()):
+            return True
+    return False
+
+
+def _sync_walk_manifest(root: str, exclusions: list) -> dict:
+    """Walk `root`, return {rel_path: {sha256, mtime, size}}. Silent on IO errors."""
+    import hashlib
+    manifest = {}
+    if not os.path.isdir(root):
+        return manifest
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            if _sync_is_excluded(rel, exclusions):
+                continue
+            try:
+                st = os.stat(full)
+                h = hashlib.sha256()
+                with open(full, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        h.update(chunk)
+                manifest[rel] = {
+                    "sha256": h.hexdigest(),
+                    "mtime": st.st_mtime,
+                    "size": st.st_size,
+                }
+            except Exception as e:
+                log.debug(f"Sync skip {full}: {e}")
+    return manifest
+
+
+def _sync_http_post_json(mac_ip: str, mac_port: int, path: str, body: dict, timeout: int = 30) -> dict:
+    import http.client as _hc
+    ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+    conn = _hc.HTTPConnection(ipv4, mac_port, timeout=timeout)
+    data = json.dumps(body).encode("utf-8")
+    conn.request("POST", path, body=data,
+                 headers={"Content-Type": "application/json", "User-Agent": "netmon-agent/1.0"})
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    if resp.status != 200:
+        raise RuntimeError(f"POST {path} -> HTTP {resp.status}: {raw[:200]}")
+    return json.loads(raw) if raw else {}
+
+
+def _sync_http_post_file(mac_ip: str, mac_port: int, path: str, file_bytes: bytes,
+                         headers: dict, timeout: int = 120) -> dict:
+    import http.client as _hc
+    ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+    conn = _hc.HTTPConnection(ipv4, mac_port, timeout=timeout)
+    merged = {"Content-Type": "application/octet-stream",
+              "User-Agent": "netmon-agent/1.0"}
+    merged.update(headers)
+    conn.request("POST", path, body=file_bytes, headers=merged)
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    if resp.status != 200:
+        raise RuntimeError(f"Upload {path} -> HTTP {resp.status}: {raw[:200]}")
+    return json.loads(raw) if raw else {}
+
+
+def _sync_http_get(mac_ip: str, mac_port: int, path: str, timeout: int = 120) -> tuple[int, bytes]:
+    import http.client as _hc
+    ipv4 = socket.getaddrinfo(mac_ip, mac_port, socket.AF_INET)[0][4][0]
+    conn = _hc.HTTPConnection(ipv4, mac_port, timeout=timeout)
+    conn.request("GET", path, headers={"User-Agent": "netmon-agent/1.0"})
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
+    """Run one sync round for a single target path."""
+    exclusions = cfg.get("sync_exclusions", list(SYNC_EXCLUSIONS))
+    manifest = _sync_walk_manifest(root, exclusions)
+    log.info(f"Sync [{target}] manifest: {len(manifest)} files from {root}")
+
+    try:
+        directives = _sync_http_post_json(
+            cfg["mac_ip"], int(cfg["mac_port"]),
+            "/api/sync/manifest",
+            {"hostname": hostname, "target": target, "manifest": manifest},
+            timeout=60,
+        )
+    except Exception as e:
+        log.warning(f"Sync [{target}] manifest exchange failed: {e}")
+        return
+
+    uploads = directives.get("upload", []) or []
+    downloads = directives.get("download", []) or []
+    log.info(f"Sync [{target}] directives: upload={len(uploads)} download={len(downloads)}")
+
+    # Uploads: files where our copy is newer.
+    for rel in uploads:
+        if _sync_is_excluded(rel, exclusions):
+            log.info(f"Sync [{target}] HARD-SKIP upload of excluded file: {rel}")
+            continue
+        full = os.path.join(root, rel.replace("/", os.sep))
+        if not os.path.isfile(full):
+            continue
+        try:
+            with open(full, "rb") as fh:
+                payload = fh.read()
+            meta = manifest.get(rel, {})
+            _sync_http_post_file(
+                cfg["mac_ip"], int(cfg["mac_port"]),
+                "/api/sync/upload",
+                payload,
+                headers={
+                    "X-Sync-Hostname": hostname,
+                    "X-Sync-Target": target,
+                    "X-Sync-Path": rel,
+                    "X-Sync-Mtime": str(meta.get("mtime", time.time())),
+                    "X-Sync-SHA256": meta.get("sha256", ""),
+                },
+            )
+            log.info(f"Sync [{target}] uploaded {rel} ({len(payload)} bytes)")
+        except Exception as e:
+            log.warning(f"Sync [{target}] upload failed for {rel}: {e}")
+
+    # Downloads: canonical copy is newer.
+    for rel in downloads:
+        if _sync_is_excluded(rel, exclusions):
+            log.info(f"Sync [{target}] HARD-SKIP download of excluded file: {rel}")
+            continue
+        try:
+            from urllib.parse import quote
+            q = f"/api/sync/download?target={quote(target)}&path={quote(rel)}"
+            status, data = _sync_http_get(cfg["mac_ip"], int(cfg["mac_port"]), q)
+            if status != 200:
+                log.warning(f"Sync [{target}] download {rel} -> HTTP {status}")
+                continue
+            full = os.path.join(root, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            tmp = full + ".sync_tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, full)
+            log.info(f"Sync [{target}] downloaded {rel} ({len(data)} bytes)")
+        except Exception as e:
+            log.warning(f"Sync [{target}] download failed for {rel}: {e}")
+
+
+def sync_loop(cfg: dict) -> None:
+    """
+    Hourly folder sync. Gated: only runs on hosts listed in sync_enabled_hosts.
+    Short initial delay so we don't slam the network at startup.
+    """
+    hostname = socket.gethostname()
+    enabled_hosts = [h.upper() for h in cfg.get("sync_enabled_hosts", [])]
+    if hostname.upper() not in enabled_hosts:
+        log.info(f"Sync loop: host {hostname} NOT in sync_enabled_hosts — idle")
+        while True:
+            time.sleep(3600)  # stay alive, do nothing
+        return
+
+    interval = int(cfg.get("sync_interval_seconds", SYNC_INTERVAL_SECONDS))
+    log.info(f"Sync loop started for {hostname} — interval {interval}s")
+    time.sleep(120)  # let the agent warm up before first sync
+
+    while True:
+        t0 = time.monotonic()
+        try:
+            paths = cfg.get("sync_paths", SYNC_PATHS)
+            for target, root in paths.items():
+                try:
+                    _sync_one_target(cfg, hostname, target, root)
+                except Exception as e:
+                    log.warning(f"Sync [{target}] round error: {e}")
+        except Exception as e:
+            log.error(f"Sync loop error: {e}")
+        elapsed = time.monotonic() - t0
+        time.sleep(max(60.0, interval - elapsed))
+
+
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def _spawn_resilient(name: str, target, args: tuple) -> threading.Thread:
@@ -1301,7 +1599,9 @@ def _spawn_resilient(name: str, target, args: tuple) -> threading.Thread:
 
 def main() -> None:
     _enforce_single_instance()  # exits immediately if another instance is running
-    log.info(f"NetMon Windows Agent v{AGENT_VERSION} starting")
+    service_mode = "--service" in sys.argv
+    log.info(f"NetMon Windows Agent v{AGENT_VERSION} starting "
+             f"({'service mode — headless' if service_mode else 'GUI mode'})")
     cfg = load_config()
     log.info(f"Mac target: {cfg['mac_ip']}:{cfg['mac_port']}")
 
@@ -1318,6 +1618,7 @@ def main() -> None:
         ("cmd-poll",   command_poll_loop,  (cfg,)),
         ("ps-session", ps_session_loop,    (cfg,)),
         ("sysinfo",    _sysinfo_loop,      ()),
+        ("sync",       sync_loop,          (cfg,)),
     ]
     live_threads = {name: _spawn_resilient(name, fn, args) for name, fn, args in thread_specs}
 
@@ -1332,6 +1633,16 @@ def main() -> None:
                     live_threads[name] = _spawn_resilient(name, fn, args)
     threading.Thread(target=_watchdog, name="watchdog", daemon=True).start()
 
+    if service_mode:
+        # Headless — no tkinter, no tray. Block forever; watchdog keeps things alive.
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            pass
+        log.info("NetMon Windows Agent (service) stopped")
+        return
+
     root = tk.Tk()
     _app = NetMonWindow(root)
 
@@ -1343,4 +1654,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # If running under bootstrap, check for hot-reload stop signal
+    _stop = globals().get('__bootstrap_stop_event__')
+    if _stop and _stop.is_set():
+        log.info("Bootstrap requested exit for hot-reload")
+        sys.exit(0)
     main()
