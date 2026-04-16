@@ -918,10 +918,27 @@ class NetMonWindow:
                 if went_red and window_hidden and self._tray_icon:
                     # Build a human-friendly message describing what went red
                     problems = []
-                    if pc == C_RED:  problems.append("Internet ping failing")
-                    if gwc == C_RED: problems.append("Router unreachable")
-                    if hc == C_RED:  problems.append("HTTP checks failing")
-                    if mc == C_RED:  problems.append("Mac Studio unreachable")
+                    if pc == C_RED:
+                        lat = state.ping_latency_ms
+                        problems.append(f"WAN ping {'timeout' if lat is None else f'{lat:.0f}ms'}")
+                    if gwc == C_RED:
+                        lat = state.gw_ping_latency_ms
+                        problems.append(f"Gateway {'unreachable' if lat is None else f'{lat:.0f}ms'}")
+                    if hc == C_RED:
+                        failed = []
+                        for url, r in state.http_results.items():
+                            if not r.get("success", True):
+                                domain = url.split("//")[-1].split("/")[0].replace("www.", "")
+                                failed.append(domain)
+                            elif r.get("latency_ms") and r["latency_ms"] > 500:
+                                domain = url.split("//")[-1].split("/")[0].replace("www.", "")
+                                failed.append(f"{domain} {r['latency_ms']:.0f}ms")
+                        if failed:
+                            problems.append(f"HTTP: {', '.join(failed)}")
+                        else:
+                            problems.append("HTTP checks failing")
+                    if mc == C_RED:
+                        problems.append("Mac Studio unreachable")
                     msg = " | ".join(problems) if problems else "Network issue detected"
                     try:
                         self._tray_icon.notify(msg, title="LangNetmon Alert")
