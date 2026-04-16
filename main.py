@@ -822,7 +822,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.2.0"
+AGENT_VERSION = "2.2.1"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -921,13 +921,17 @@ def _do_update_check(cfg: dict) -> bool:
             f"timeout /t 3 /nobreak >nul 2>&1\r\n"
             f"copy /Y \"{tmp.name}\" \"{current_exe}\" >nul 2>&1\r\n"
             f"del \"{tmp.name}\" >nul 2>&1\r\n"
-            f"start /min \"\" \"{current_exe}\"\r\n"
+            f"start /b \"\" \"{current_exe}\"\r\n"
             f"(del \"%~f0\") >nul 2>&1\r\n"
         )
         bat.close()
 
+        _si = subprocess.STARTUPINFO()
+        _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        _si.wShowWindow = subprocess.SW_HIDE
         subprocess.Popen(
             ["cmd", "/c", bat.name],
+            startupinfo=_si,
             creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
