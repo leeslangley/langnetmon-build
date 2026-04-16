@@ -822,7 +822,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.0.0"
+AGENT_VERSION = "2.1.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1551,8 +1551,9 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
 
 def sync_loop(cfg: dict) -> None:
     """
-    Hourly folder sync. Gated: only runs on hosts listed in sync_enabled_hosts.
-    Short initial delay so we don't slam the network at startup.
+    Folder sync. Gated: only runs on hosts listed in sync_enabled_hosts.
+    Runs immediately at startup after a short 30s warm-up for the network,
+    then repeats on the hourly interval.
     """
     hostname = socket.gethostname()
     enabled_hosts = [h.upper() for h in cfg.get("sync_enabled_hosts", [])]
@@ -1563,8 +1564,8 @@ def sync_loop(cfg: dict) -> None:
         return
 
     interval = int(cfg.get("sync_interval_seconds", SYNC_INTERVAL_SECONDS))
-    log.info(f"Sync loop started for {hostname} — interval {interval}s")
-    time.sleep(120)  # let the agent warm up before first sync
+    log.info(f"Sync loop started for {hostname} — interval {interval}s (first run after 30s warm-up)")
+    time.sleep(30)  # brief warm-up so network is ready, then sync immediately
 
     while True:
         t0 = time.monotonic()
