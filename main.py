@@ -822,7 +822,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.1.0"
+AGENT_VERSION = "2.2.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1477,11 +1477,62 @@ def _sync_http_get(mac_ip: str, mac_port: int, path: str, timeout: int = 120) ->
     return resp.status, data
 
 
+def _sync_cache_dir() -> Path:
+    """Directory for local manifest cache. Prefers %LOCALAPPDATA%\\LangNetmon,
+    falls back to the agent's own dir if LOCALAPPDATA is unavailable."""
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        d = Path(base) / "LangNetmon"
+    else:
+        d = _HERE
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        d = _HERE
+    return d
+
+
+def _sync_cache_path(target: str) -> Path:
+    return _sync_cache_dir() / f"sync_cache_{target}.json"
+
+
+def _sync_load_cached_manifest(target: str) -> Optional[dict]:
+    p = _sync_cache_path(target)
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        log.debug(f"Sync cache [{target}] read failed: {e}")
+        return None
+
+
+def _sync_save_cached_manifest(target: str, manifest: dict) -> None:
+    p = _sync_cache_path(target)
+    try:
+        tmp = p.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        os.replace(tmp, p)
+    except Exception as e:
+        log.debug(f"Sync cache [{target}] write failed: {e}")
+
+
 def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
     """Run one sync round for a single target path."""
     exclusions = cfg.get("sync_exclusions", list(SYNC_EXCLUSIONS))
     manifest = _sync_walk_manifest(root, exclusions)
     log.info(f"Sync [{target}] manifest: {len(manifest)} files from {root}")
+
+    # Local manifest cache: if the manifest is identical to the one saved on
+    # the previous sync run, nothing changed locally — skip the server round
+    # trip entirely. Massive win for WoW addons (~17k files).
+    cached = _sync_load_cached_manifest(target)
+    if cached is not None and cached == manifest:
+        log.info(f"Sync [{target}] local manifest unchanged since last run — skipping server POST")
+        return
 
     try:
         directives = _sync_http_post_json(
@@ -1548,6 +1599,12 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
         except Exception as e:
             log.warning(f"Sync [{target}] download failed for {rel}: {e}")
 
+    # Cache the manifest we just exchanged with the server. When downloads
+    # happened, local files changed so this manifest no longer matches disk —
+    # skip caching and let the next run re-walk + re-POST to re-establish.
+    if not downloads:
+        _sync_save_cached_manifest(target, manifest)
+
 
 def sync_loop(cfg: dict) -> None:
     """
@@ -1571,11 +1628,26 @@ def sync_loop(cfg: dict) -> None:
         t0 = time.monotonic()
         try:
             paths = cfg.get("sync_paths", SYNC_PATHS)
-            for target, root in paths.items():
+
+            def _run_target(tgt: str, rt: str) -> None:
                 try:
-                    _sync_one_target(cfg, hostname, target, root)
+                    _sync_one_target(cfg, hostname, tgt, rt)
                 except Exception as e:
-                    log.warning(f"Sync [{target}] round error: {e}")
+                    log.warning(f"Sync [{tgt}] round error: {e}")
+
+            threads = []
+            for target, root in paths.items():
+                th = threading.Thread(
+                    target=_run_target, args=(target, root),
+                    name=f"sync-{target}", daemon=True,
+                )
+                th.start()
+                threads.append((target, th))
+            for target, th in threads:
+                th.join(timeout=300)
+                if th.is_alive():
+                    log.warning(f"Sync [{target}] thread still running after 300s join timeout — "
+                                f"continuing loop; thread will be abandoned")
         except Exception as e:
             log.error(f"Sync loop error: {e}")
         elapsed = time.monotonic() - t0
