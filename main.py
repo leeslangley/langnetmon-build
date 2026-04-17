@@ -173,6 +173,8 @@ _internet_state: dict = {
     "consecutive_failures": 0,
     "last_notified": 0.0,
     "down_since": 0.0,
+    "http_partial_down": False,
+    "http_partial_failures": 0,
 }
 
 # Module-level tray icon reference — set by NetMonWindow._run_tray so that
@@ -587,6 +589,37 @@ def _notify_user(title: str, body: str) -> None:
         pass
 
 
+def _short_domain(url: str) -> str:
+    """Strip protocol and 'www.' prefix from a probe URL, return bare host."""
+    s = url.strip()
+    if s.startswith("https://"):
+        s = s[8:]
+    elif s.startswith("http://"):
+        s = s[7:]
+    if s.startswith("www."):
+        s = s[4:]
+    s = s.split("/", 1)[0]
+    return s
+
+
+def _format_http_probe_status(results: dict) -> str:
+    """Render probe results as 'name OK (Xms)' for success or 'name \u2717' for failure."""
+    if not results:
+        return "no probes"
+    parts = []
+    for url, r in results.items():
+        name = _short_domain(url)
+        if r.get("success"):
+            lat = r.get("latency_ms")
+            if lat is not None:
+                parts.append(f"{name} OK ({int(round(lat))}ms)")
+            else:
+                parts.append(f"{name} OK")
+        else:
+            parts.append(f"{name} \u2717")
+    return ", ".join(parts)
+
+
 # ── Report to Mac ─────────────────────────────────────────────────────────
 
 def report_loop(cfg: dict) -> None:
@@ -640,12 +673,46 @@ def report_loop(cfg: dict) -> None:
                 _internet_state["down"] = True
                 _internet_state["down_since"] = _now
                 gw_status = "reachable" if gw_ping_ok else "unreachable"
+                http_status = _format_http_probe_status(http_results_snapshot)
                 _notify_user(
                     "\u26a0 Internet Down",
-                    f"WAN ping and HTTP probes failing. "
-                    f"Gateway is {gw_status}. Check your connection.",
+                    f"WAN ping failing. HTTP: {http_status}. "
+                    f"Gateway {gw_status}.",
                 )
-                log.warning("Internet DOWN: WAN ping and HTTP probes both failing")
+                log.warning(f"Internet DOWN: WAN ping failing, HTTP: {http_status}")
+
+            # ── HTTP-only partial-failure detection ──────────────────────
+            # WAN ping is fine but at least one HTTP probe is failing. Fires
+            # after 2 consecutive report cycles so we don't alert on single
+            # flaky probe responses. Skipped while WAN is also down — the
+            # full outage tracker above owns that state.
+            if ping_ok:
+                if any_http_failed:
+                    _internet_state["http_partial_failures"] += 1
+                else:
+                    if _internet_state["http_partial_down"]:
+                        _notify_user(
+                            "\u2713 HTTP Probes Restored",
+                            f"All HTTP probes succeeding. "
+                            f"{_format_http_probe_status(http_results_snapshot)}.",
+                        )
+                        log.info("HTTP probes RESTORED")
+                    _internet_state["http_partial_failures"] = 0
+                    _internet_state["http_partial_down"] = False
+
+                if (
+                    _internet_state["http_partial_failures"] >= 2
+                    and not _internet_state["http_partial_down"]
+                    and not _internet_state["down"]
+                ):
+                    _internet_state["http_partial_down"] = True
+                    gw_status = "reachable" if gw_ping_ok else "unreachable"
+                    http_status = _format_http_probe_status(http_results_snapshot)
+                    _notify_user(
+                        "\u26a0 HTTP Probe Alert",
+                        f"{http_status}. Gateway {gw_status}.",
+                    )
+                    log.warning(f"HTTP partial failure: {http_status}")
             # ── End internet-down detection ───────────────────────────────
 
             payload = {
