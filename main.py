@@ -1682,7 +1682,18 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
     downloads = directives.get("download", []) or []
     log.info(f"Sync [{target}] directives: upload={len(uploads)} download={len(downloads)}")
 
+    # Friendly target names for user-facing toasts.
+    _sync_friendly = {
+        "wow-addons": "WoW Addons",
+        "wow-wtf": "WoW Settings",
+        "old-cylance": "Cylance Backup",
+    }
+    friendly = _sync_friendly.get(target, target)
+
     # Uploads: files where our copy is newer.
+    if uploads:
+        _notify_user("LangNetmon Sync", f"Syncing {friendly} — uploading {len(uploads)} new files")
+    uploads_ok = 0
     for rel in uploads:
         if _sync_is_excluded(rel, exclusions):
             log.info(f"Sync [{target}] HARD-SKIP upload of excluded file: {rel}")
@@ -1707,10 +1718,16 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
                 },
             )
             log.info(f"Sync [{target}] uploaded {rel} ({len(payload)} bytes)")
+            uploads_ok += 1
         except Exception as e:
             log.warning(f"Sync [{target}] upload failed for {rel}: {e}")
+    if uploads:
+        _notify_user("LangNetmon Sync", f"Syncing {friendly} — {uploads_ok} files uploaded successfully")
 
     # Downloads: canonical copy is newer.
+    if downloads:
+        _notify_user("LangNetmon Sync", f"Syncing {friendly} — downloading {len(downloads)} files")
+    downloads_ok = 0
     for rel in downloads:
         if _sync_is_excluded(rel, exclusions):
             log.info(f"Sync [{target}] HARD-SKIP download of excluded file: {rel}")
@@ -1729,8 +1746,14 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
                 fh.write(data)
             os.replace(tmp, full)
             log.info(f"Sync [{target}] downloaded {rel} ({len(data)} bytes)")
+            downloads_ok += 1
         except Exception as e:
             log.warning(f"Sync [{target}] download failed for {rel}: {e}")
+    if downloads:
+        if downloads_ok == len(downloads):
+            _notify_user("LangNetmon Sync", f"Syncing {friendly} — {downloads_ok} files downloaded successfully")
+        else:
+            _notify_user("LangNetmon Sync", f"Syncing {friendly} — {downloads_ok} of {len(downloads)} files downloaded")
 
     # Cache the manifest we just exchanged with the server. When downloads
     # happened, local files changed so this manifest no longer matches disk —
