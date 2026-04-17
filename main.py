@@ -1072,7 +1072,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.7.0"
+AGENT_VERSION = "2.8.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1327,6 +1327,54 @@ def _run_command(cmd: str, args: dict) -> dict:
 
         elif cmd == "sysinfo":
             return dict(_sysinfo)
+
+        elif cmd == "sync_now":
+            # Trigger one sync cycle in a background thread so the command poll
+            # loop doesn't block on it. Optional `target` arg syncs just one
+            # target; otherwise all configured targets are synced.
+            target = args.get("target")
+            cfg = load_config()
+            hostname = socket.gethostname()
+            paths = cfg.get("sync_paths", SYNC_PATHS)
+
+            if target is not None:
+                if target not in paths:
+                    return {
+                        "error": f"unknown sync target: {target}",
+                        "available": list(paths.keys()),
+                    }
+                targets_to_run = {target: paths[target]}
+            else:
+                targets_to_run = dict(paths)
+
+            def _triggered_sync():
+                log.info(
+                    f"Sync [triggered via command] starting — targets: "
+                    f"{list(targets_to_run.keys())}"
+                )
+                for tgt, rt in targets_to_run.items():
+                    try:
+                        _sync_one_target(cfg, hostname, tgt, rt)
+                    except Exception as e:
+                        log.warning(
+                            f"Sync [triggered via command] [{tgt}] error: {e}"
+                        )
+                log.info(
+                    f"Sync [triggered via command] finished — targets: "
+                    f"{list(targets_to_run.keys())}"
+                )
+
+            threading.Thread(
+                target=_triggered_sync,
+                name="sync-triggered",
+                daemon=True,
+            ).start()
+
+            return {
+                "status": "triggered",
+                "target": target if target else "all",
+                "targets": list(targets_to_run.keys()),
+            }
 
         elif cmd == "shell":
             ps_cmd = args.get("cmd", "").strip()
