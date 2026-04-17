@@ -5,6 +5,7 @@ Monitors network health, displays a floating status window,
 and reports metrics to the Mac Studio daemon.
 """
 
+import hashlib
 import http.client
 import json
 import logging
@@ -180,6 +181,12 @@ _internet_state: dict = {
 # Module-level tray icon reference — set by NetMonWindow._run_tray so that
 # report_loop (which runs in a background thread) can fire toast notifications.
 _tray_icon: Optional[pystray.Icon] = None
+
+# Module-level tkinter root reference — set in main() once the Tk root is
+# constructed. Background threads (e.g. sync_loop) use this to marshal modal
+# dialog requests onto the tkinter main thread via root.after(). Remains None
+# when running in --service (headless) mode so callers know to fall back.
+_tk_root: Optional["tk.Tk"] = None
 
 # ── Sysinfo ───────────────────────────────────────────────────────────────
 
@@ -1065,7 +1072,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.5.0"
+AGENT_VERSION = "2.6.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1767,6 +1774,192 @@ def _sync_save_cached_manifest(target: str, manifest: dict) -> None:
         log.debug(f"Sync cache [{target}] write failed: {e}")
 
 
+# ── Download-consent prompt (v2.6.0) ──────────────────────────────────────
+# Downloads (canonical copy on Mac is newer than local) now require user
+# consent via a tkinter modal dialog. Uploads remain automatic so the Mac
+# canonical store is always kept up to date.
+#
+# Smart-decline: if the user declines, we hash the download list (sorted
+# paths) and record the hash in %LOCALAPPDATA%\LangNetmon\sync-declines.json.
+# On the next sync round, if the hash still matches we silently skip the
+# prompt — the user already said no to that exact set of files. If the list
+# changes (canonical moved on), the hash differs and we prompt again.
+
+_SYNC_DIALOG_TIMEOUT_SEC = 300.0   # 5 minutes — treated as "No" if no response
+
+
+def _sync_declines_path() -> Path:
+    return _sync_cache_dir() / "sync-declines.json"
+
+
+def _sync_load_declines() -> dict:
+    p = _sync_declines_path()
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception as e:
+        log.debug(f"Sync declines read failed: {e}")
+        return {}
+
+
+def _sync_save_declines(data: dict) -> None:
+    p = _sync_declines_path()
+    try:
+        tmp = p.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, p)
+    except Exception as e:
+        log.debug(f"Sync declines write failed: {e}")
+
+
+def _sync_download_hash(downloads: list, server_manifest: Optional[dict] = None) -> str:
+    """Compute a deterministic hash of the download list. Uses sorted paths;
+    if a server manifest is provided, size metadata is folded in so that a
+    file being replaced by a differently-sized file invalidates the decline.
+    """
+    h = hashlib.sha256()
+    for rel in sorted(str(p) for p in downloads):
+        h.update(rel.encode("utf-8"))
+        if server_manifest:
+            meta = server_manifest.get(rel) or {}
+            size = meta.get("size")
+            if size is not None:
+                h.update(f"|{size}".encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _prompt_download_consent(friendly: str, downloads: list,
+                             timeout_sec: float = _SYNC_DIALOG_TIMEOUT_SEC) -> bool:
+    """Show a modal tkinter dialog asking the user to approve the download.
+    Returns True if the user clicked Yes, False otherwise (No / X / timeout).
+
+    Safe to call from any thread — marshals onto the tkinter main thread via
+    root.after(). Raises RuntimeError if no tkinter root is available so the
+    caller can fall back to automatic download (service mode, early startup).
+    """
+    if _tk_root is None:
+        raise RuntimeError("no tkinter root available (headless/service mode?)")
+
+    result = {"accepted": None, "failed": False}
+    done = threading.Event()
+
+    def _show_dialog():
+        try:
+            dlg = tk.Toplevel(_tk_root)
+            dlg.title(f"{friendly} sync")
+            dlg.resizable(False, False)
+            try:
+                dlg.attributes("-topmost", True)
+            except Exception:
+                pass
+
+            n = len(downloads)
+            header = tk.Label(
+                dlg,
+                text=f"{friendly} sync",
+                font=("Segoe UI", 11, "bold"),
+                justify="left",
+            )
+            header.pack(anchor="w", padx=20, pady=(18, 6))
+
+            summary = tk.Label(
+                dlg,
+                text=f"{n} file{'s' if n != 1 else ''} changed on the Mac.",
+                justify="left",
+            )
+            summary.pack(anchor="w", padx=20)
+
+            preview_lines = []
+            for rel in downloads[:5]:
+                preview_lines.append(f"  • {rel}")
+            if n > 5:
+                preview_lines.append(f"  …and {n - 5} more")
+            tk.Label(
+                dlg,
+                text="\n".join(preview_lines),
+                justify="left",
+                font=("Consolas", 9),
+            ).pack(anchor="w", padx=20, pady=(6, 10))
+
+            tk.Label(dlg, text="Download now?", justify="left").pack(
+                anchor="w", padx=20, pady=(0, 10)
+            )
+
+            btn_frame = tk.Frame(dlg)
+            btn_frame.pack(pady=(0, 16), padx=20, anchor="e")
+
+            def _finish(accepted: bool):
+                if result["accepted"] is None:
+                    result["accepted"] = accepted
+                    done.set()
+                try:
+                    dlg.destroy()
+                except Exception:
+                    pass
+
+            yes_btn = tk.Button(btn_frame, text="Yes", width=10,
+                                command=lambda: _finish(True))
+            no_btn = tk.Button(btn_frame, text="No", width=10,
+                               command=lambda: _finish(False))
+            no_btn.pack(side="right", padx=(6, 0))
+            yes_btn.pack(side="right")
+            dlg.protocol("WM_DELETE_WINDOW", lambda: _finish(False))
+
+            dlg.update_idletasks()
+            try:
+                rx = _tk_root.winfo_rootx()
+                ry = _tk_root.winfo_rooty()
+                rw = max(_tk_root.winfo_width(), 1)
+                rh = max(_tk_root.winfo_height(), 1)
+                w = dlg.winfo_width()
+                h = dlg.winfo_height()
+                dlg.geometry(f"+{rx + (rw - w) // 2}+{ry + (rh - h) // 2}")
+            except Exception:
+                pass
+
+            try:
+                dlg.grab_set()
+            except Exception:
+                pass
+            dlg.focus_force()
+            yes_btn.focus_set()
+        except Exception as e:
+            log.warning(f"Sync consent dialog failed to render: {e}")
+            result["failed"] = True
+            done.set()
+
+    try:
+        _tk_root.after(0, _show_dialog)
+    except Exception as e:
+        raise RuntimeError(f"failed to schedule dialog on tk main thread: {e}")
+
+    if not done.wait(timeout=timeout_sec):
+        log.warning(
+            f"Sync consent dialog: no response within {timeout_sec:.0f}s — "
+            f"treating as No"
+        )
+        # Best-effort: tell the tk thread to drop the dialog. We don't wait.
+        def _force_close():
+            # Nothing to close explicitly here — user may still click Yes/No
+            # and that will just be ignored since we've already decided.
+            pass
+        try:
+            _tk_root.after(0, _force_close)
+        except Exception:
+            pass
+        return False
+
+    if result["failed"]:
+        raise RuntimeError("dialog failed to render")
+
+    return bool(result["accepted"])
+
+
 def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
     """Run one sync round for a single target path."""
     exclusions = cfg.get("sync_exclusions", list(SYNC_EXCLUSIONS))
@@ -1838,7 +2031,56 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
     if uploads:
         _notify_user("LangNetmon Sync", f"Syncing {friendly} — {uploads_ok} files uploaded successfully")
 
-    # Downloads: canonical copy is newer.
+    # Downloads: canonical copy is newer. Requires explicit user consent
+    # (v2.6.0). Uploads above are unaffected and remain automatic.
+    if downloads:
+        dl_hash = _sync_download_hash(downloads)
+        declines = _sync_load_declines()
+        prev = declines.get(target) if isinstance(declines.get(target), dict) else None
+
+        if prev and prev.get("hash") == dl_hash:
+            log.info(
+                f"Sync [{target}] {len(downloads)} downloads match a previously "
+                f"declined manifest (hash={dl_hash[:12]}, declined_at="
+                f"{prev.get('declined_at', '?')}) — skipping prompt and download"
+            )
+            downloads = []
+        else:
+            try:
+                accepted = _prompt_download_consent(friendly, downloads)
+                dialog_ok = True
+            except Exception as e:
+                log.warning(
+                    f"Sync [{target}] consent dialog unavailable ({e}) — "
+                    f"falling back to automatic download for {len(downloads)} files"
+                )
+                accepted = True
+                dialog_ok = False
+
+            if dialog_ok and not accepted:
+                declines[target] = {
+                    "hash": dl_hash,
+                    "declined_at": datetime.now().isoformat(timespec="seconds"),
+                    "count": len(downloads),
+                    "friendly": friendly,
+                }
+                _sync_save_declines(declines)
+                log.info(
+                    f"Sync [{target}] user DECLINED download of {len(downloads)} "
+                    f"files (hash={dl_hash[:12]}) — will re-prompt if the manifest changes"
+                )
+                downloads = []
+            else:
+                # Accepted (or fallback) — clear any stale decline entry so future
+                # identical manifests prompt cleanly.
+                if target in declines:
+                    declines.pop(target, None)
+                    _sync_save_declines(declines)
+                if dialog_ok:
+                    log.info(
+                        f"Sync [{target}] user ACCEPTED download of {len(downloads)} files"
+                    )
+
     if downloads:
         _notify_user("LangNetmon Sync", f"Syncing {friendly} — downloading {len(downloads)} files")
     downloads_ok = 0
@@ -1987,6 +2229,10 @@ def main() -> None:
         return
 
     root = tk.Tk()
+    # Expose the root to background threads so they can marshal modal dialogs
+    # (e.g. sync download-consent prompt) onto the tk main thread.
+    global _tk_root
+    _tk_root = root
     _app = NetMonWindow(root)
 
     try:
