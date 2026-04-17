@@ -1072,7 +1072,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.6.0"
+AGENT_VERSION = "2.7.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1833,7 +1833,54 @@ def _sync_download_hash(downloads: list, server_manifest: Optional[dict] = None)
     return h.hexdigest()
 
 
+def _relative_time(mtime: Optional[float], now: Optional[float] = None) -> str:
+    """Format an mtime (epoch seconds) as a coarse human-friendly string like
+    "2 minutes ago", "1 hour ago", "3 days ago". Returns "just now" for <30s
+    and "unknown" if mtime is None/invalid. Used by the sync consent dialog
+    so the user can see how recent each pending download is.
+    """
+    if mtime is None:
+        return "unknown"
+    try:
+        mt = float(mtime)
+    except (TypeError, ValueError):
+        return "unknown"
+    if now is None:
+        now = time.time()
+    delta = now - mt
+    if delta < 0:
+        # Clock skew between Mac and Windows — don't embarrass ourselves with
+        # "-5 seconds ago". Treat future mtimes as fresh.
+        return "just now"
+    if delta < 30:
+        return "just now"
+    if delta < 90:
+        return "1 minute ago"
+    if delta < 3600:
+        mins = int(delta // 60)
+        return f"{mins} minutes ago"
+    if delta < 5400:
+        return "1 hour ago"
+    if delta < 86400:
+        hours = int(delta // 3600)
+        return f"{hours} hours ago"
+    if delta < 172800:
+        return "1 day ago"
+    if delta < 2592000:  # ~30 days
+        days = int(delta // 86400)
+        return f"{days} days ago"
+    if delta < 5184000:  # ~60 days
+        return "1 month ago"
+    if delta < 31536000:  # ~365 days
+        months = int(delta // 2592000)
+        return f"{months} months ago"
+    years = int(delta // 31536000)
+    return "1 year ago" if years == 1 else f"{years} years ago"
+
+
 def _prompt_download_consent(friendly: str, downloads: list,
+                             download_mtimes: Optional[dict] = None,
+                             download_origins: Optional[dict] = None,
                              timeout_sec: float = _SYNC_DIALOG_TIMEOUT_SEC) -> bool:
     """Show a modal tkinter dialog asking the user to approve the download.
     Returns True if the user clicked Yes, False otherwise (No / X / timeout).
@@ -1874,9 +1921,52 @@ def _prompt_download_consent(friendly: str, downloads: list,
             )
             summary.pack(anchor="w", padx=20)
 
+            # Pad paths to a common width so the trailing column lines up
+            # visually. Prefer origin info ("from HOST, HH:MM DD/MM/YY") when
+            # the daemon supplies it (v2.7.0+), fall back to the mtime-only
+            # format for pre-v2.7.0 uploads that have no origin record, and
+            # bare-path as a final fallback.
+            mtimes = download_mtimes or {}
+            origins = download_origins or {}
+            preview_rels = downloads[:5]
+            max_path_len = max((len(str(p)) for p in preview_rels), default=0)
+            now = time.time()
             preview_lines = []
-            for rel in downloads[:5]:
-                preview_lines.append(f"  • {rel}")
+            for rel in preview_rels:
+                origin = origins.get(rel)
+                origin_str = None
+                if isinstance(origin, dict):
+                    uploader = origin.get("uploader") or "unknown device"
+                    uploaded_at = origin.get("uploaded_at")
+                    try:
+                        ts_clean = str(uploaded_at).rstrip("Z")
+                        dt = datetime.fromisoformat(ts_clean)
+                        # Daemon sends UTC; convert to local for display.
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc).astimezone()
+                        else:
+                            dt = dt.astimezone()
+                        origin_str = (
+                            f"from {uploader}, "
+                            f"{dt.strftime('%H:%M %d/%m/%y')}"
+                        )
+                    except Exception:
+                        origin_str = None
+
+                if origin_str:
+                    preview_lines.append(
+                        f"  • {str(rel).ljust(max_path_len)}  — {origin_str}"
+                    )
+                    continue
+
+                mt = mtimes.get(rel)
+                if mt is not None:
+                    when = _relative_time(mt, now=now)
+                    preview_lines.append(
+                        f"  • {str(rel).ljust(max_path_len)}  ({when})"
+                    )
+                else:
+                    preview_lines.append(f"  • {rel}")
             if n > 5:
                 preview_lines.append(f"  …and {n - 5} more")
             tk.Label(
@@ -1987,6 +2077,8 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
 
     uploads = directives.get("upload", []) or []
     downloads = directives.get("download", []) or []
+    download_mtimes = directives.get("download_mtimes", {}) or {}
+    download_origins = directives.get("download_origins", {}) or {}
     log.info(f"Sync [{target}] directives: upload={len(uploads)} download={len(downloads)}")
 
     # Friendly target names for user-facing toasts.
@@ -2047,7 +2139,10 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
             downloads = []
         else:
             try:
-                accepted = _prompt_download_consent(friendly, downloads)
+                accepted = _prompt_download_consent(
+                    friendly, downloads, download_mtimes=download_mtimes,
+                    download_origins=download_origins,
+                )
                 dialog_ok = True
             except Exception as e:
                 log.warning(
