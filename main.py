@@ -650,9 +650,21 @@ def report_loop(cfg: dict) -> None:
             # Requires BOTH WAN ping (8.8.8.8) AND at least one HTTP probe
             # to fail before counting toward the outage threshold.
             _now = time.time()
-            any_http_failed = not http_ok or any(
-                not v.get("success", True) for v in http_results_snapshot.values()
-            ) if http_results_snapshot else not http_ok
+            # Per-probe failure count this cycle. Falls back to the aggregate
+            # http_ok flag when per-probe data isn't available.
+            if http_results_snapshot:
+                http_fail_count = sum(
+                    1 for v in http_results_snapshot.values()
+                    if not v.get("success", True)
+                )
+            else:
+                http_fail_count = 0 if http_ok else 1
+            # Full outage still trips on a single HTTP failure combined with
+            # WAN ping down — that's a genuine connectivity loss signal.
+            any_http_failed = http_fail_count >= 1 or not http_ok
+            # Partial-HTTP (WAN-up) alerts require 2+ probes failing in the
+            # same cycle — cuts noise from individual flaky endpoints.
+            http_multi_failed = http_fail_count >= 2
 
             if not ping_ok and any_http_failed:
                 _internet_state["consecutive_failures"] += 1
@@ -682,23 +694,34 @@ def report_loop(cfg: dict) -> None:
                 log.warning(f"Internet DOWN: WAN ping failing, HTTP: {http_status}")
 
             # ── HTTP-only partial-failure detection ──────────────────────
-            # WAN ping is fine but at least one HTTP probe is failing. Fires
-            # after 2 consecutive report cycles so we don't alert on single
-            # flaky probe responses. Skipped while WAN is also down — the
-            # full outage tracker above owns that state.
+            # WAN ping is fine but 2+ HTTP probes are failing in the same
+            # cycle. Fires only after 2 consecutive report cycles so we
+            # don't alert on a single round of flaky probe responses.
+            # Single-probe failures are logged per-probe but NOT alerted.
+            # Skipped while WAN is also down — the full outage tracker
+            # above owns that state.
             if ping_ok:
-                if any_http_failed:
+                if http_multi_failed:
                     _internet_state["http_partial_failures"] += 1
                 else:
                     if _internet_state["http_partial_down"]:
                         _notify_user(
                             "\u2713 HTTP Probes Restored",
-                            f"All HTTP probes succeeding. "
+                            f"HTTP probe failures dropped below the "
+                            f"2-domain alert threshold. "
                             f"{_format_http_probe_status(http_results_snapshot)}.",
                         )
                         log.info("HTTP probes RESTORED")
                     _internet_state["http_partial_failures"] = 0
                     _internet_state["http_partial_down"] = False
+
+                if http_fail_count == 1:
+                    # Single-domain failure — recorded but suppressed from
+                    # alerts per the 2+ noise-reduction rule.
+                    log.info(
+                        f"HTTP single-probe failure (suppressed): "
+                        f"{_format_http_probe_status(http_results_snapshot)}"
+                    )
 
                 if (
                     _internet_state["http_partial_failures"] >= 2
@@ -710,9 +733,13 @@ def report_loop(cfg: dict) -> None:
                     http_status = _format_http_probe_status(http_results_snapshot)
                     _notify_user(
                         "\u26a0 HTTP Probe Alert",
+                        f"{http_fail_count} HTTP probes failing. "
                         f"{http_status}. Gateway {gw_status}.",
                     )
-                    log.warning(f"HTTP partial failure: {http_status}")
+                    log.warning(
+                        f"HTTP partial failure ({http_fail_count} probes): "
+                        f"{http_status}"
+                    )
             # ── End internet-down detection ───────────────────────────────
 
             payload = {
@@ -979,9 +1006,29 @@ class NetMonWindow:
                 except Exception:
                     pass
 
+                # Count hard HTTP probe failures — alerts only fire when 2+
+                # domains are failing simultaneously, to cut noise from a
+                # single flaky endpoint.
+                http_failed_domains = [
+                    url for url, r in state.http_results.items()
+                    if not r.get("success", True)
+                ]
+                http_alertable = len(http_failed_domains) >= 2
+
                 # Fire a toast notification when status goes red and window is hidden
                 window_hidden = not self.root.winfo_viewable()
                 went_red = (tray_color == C_RED and self._prev_tray_color != C_RED)
+
+                # If HTTP is the *only* red signal and fewer than 2 domains
+                # are actually failing, suppress the toast. The tray color
+                # still reflects the per-probe state, but we don't page on
+                # a single-probe hiccup.
+                only_http_red = (
+                    hc == C_RED and pc != C_RED and gwc != C_RED and mc != C_RED
+                )
+                if went_red and only_http_red and not http_alertable:
+                    went_red = False
+
                 if went_red and window_hidden and self._tray_icon:
                     # Build a human-friendly message describing what went red
                     problems = []
@@ -991,7 +1038,7 @@ class NetMonWindow:
                     if gwc == C_RED:
                         lat = state.gw_ping_latency_ms
                         problems.append(f"Gateway {'unreachable' if lat is None else f'{lat:.0f}ms'}")
-                    if hc == C_RED:
+                    if hc == C_RED and http_alertable:
                         failed = []
                         for url, r in state.http_results.items():
                             if not r.get("success", True):
@@ -1018,7 +1065,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.4.0"
+AGENT_VERSION = "2.5.0"
 
 
 def _check_for_update(cfg: dict) -> None:
