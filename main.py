@@ -1072,7 +1072,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.8.1"
+AGENT_VERSION = "2.9.0"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1461,13 +1461,12 @@ def _run_command(cmd: str, args: dict) -> dict:
                     f"Sync [triggered via command] starting — targets: "
                     f"{list(targets_to_run.keys())}"
                 )
-                for tgt, rt in targets_to_run.items():
-                    try:
-                        _sync_one_target(cfg, hostname, tgt, rt)
-                    except Exception as e:
-                        log.warning(
-                            f"Sync [triggered via command] [{tgt}] error: {e}"
-                        )
+                try:
+                    _sync_run_round(cfg, hostname, targets_to_run)
+                except Exception as e:
+                    log.warning(
+                        f"Sync [triggered via command] error: {e}"
+                    )
                 log.info(
                     f"Sync [triggered via command] finished — targets: "
                     f"{list(targets_to_run.keys())}"
@@ -2035,19 +2034,131 @@ def _relative_time(mtime: Optional[float], now: Optional[float] = None) -> str:
     return "1 year ago" if years == 1 else f"{years} years ago"
 
 
-def _prompt_download_consent(friendly: str, downloads: list,
-                             download_mtimes: Optional[dict] = None,
-                             download_origins: Optional[dict] = None,
-                             timeout_sec: float = _SYNC_DIALOG_TIMEOUT_SEC) -> bool:
-    """Show a modal tkinter dialog asking the user to approve the download.
-    Returns True if the user clicked Yes, False otherwise (No / X / timeout).
+def _summarize_pending(pending: dict) -> tuple:
+    """Summarise one target's pending downloads for the consolidated dialog.
 
-    Safe to call from any thread — marshals onto the tkinter main thread via
-    root.after(). Raises RuntimeError if no tkinter root is available so the
+    Returns (count, uploader_or_none, ts_formatted_or_none).
+      - count: number of files to download for this target
+      - uploader: latest uploader across download_origins (the one whose
+        uploaded_at is the most recent) — None if no origin data is available
+      - ts_formatted: "HH:MM DD/MM/YY" from the latest mtime across the
+        target's files (daemon supplies UTC epoch); if no mtimes are available
+        falls back to the latest uploaded_at. None when neither exists.
+    """
+    downloads = pending.get("downloads") or []
+    origins = pending.get("download_origins") or {}
+    mtimes = pending.get("download_mtimes") or {}
+    count = len(downloads)
+
+    latest_uploader = None
+    latest_upload_ts = None
+    for rel in downloads:
+        o = origins.get(rel)
+        if not isinstance(o, dict):
+            continue
+        uploader = o.get("uploader")
+        uploaded_at = o.get("uploaded_at")
+        if not uploader or not uploaded_at:
+            continue
+        try:
+            ts_clean = str(uploaded_at).rstrip("Z")
+            dt = datetime.fromisoformat(ts_clean)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts_epoch = dt.timestamp()
+        except Exception:
+            continue
+        if latest_upload_ts is None or ts_epoch > latest_upload_ts:
+            latest_upload_ts = ts_epoch
+            latest_uploader = uploader
+
+    if latest_uploader is None:
+        return count, None, None
+
+    latest_mtime = None
+    for rel in downloads:
+        mt = mtimes.get(rel)
+        try:
+            mt_f = float(mt)
+        except (TypeError, ValueError):
+            continue
+        if latest_mtime is None or mt_f > latest_mtime:
+            latest_mtime = mt_f
+
+    ts_source = latest_mtime if latest_mtime is not None else latest_upload_ts
+    ts_formatted = None
+    try:
+        dt_out = datetime.fromtimestamp(ts_source).astimezone()
+        ts_formatted = dt_out.strftime("%H:%M %d/%m/%y")
+    except Exception:
+        ts_formatted = None
+
+    return count, latest_uploader, ts_formatted
+
+
+def _sync_consolidated_download_hash(pending_syncs: list) -> str:
+    """Hash of all pending downloads across all targets (sorted by
+    ``target|path``). Used to silently skip prompting when the user already
+    declined this exact consolidated set.
+    """
+    h = hashlib.sha256()
+    rows = []
+    for p in pending_syncs:
+        tgt = str(p.get("target", ""))
+        for rel in p.get("downloads", []) or []:
+            rows.append(f"{tgt}|{rel}")
+    for row in sorted(rows):
+        h.update(row.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _prompt_consolidated_consent(pending_syncs: list,
+                                 timeout_sec: float = _SYNC_DIALOG_TIMEOUT_SEC) -> bool:
+    """Show a SINGLE modal tkinter dialog covering all pending downloads
+    across all sync targets. Returns True if the user clicked Yes, False
+    otherwise (No / X / timeout).
+
+    pending_syncs: list of dicts with keys {target, friendly, downloads,
+    download_mtimes, download_origins}. Targets with empty downloads are
+    ignored. Raises RuntimeError if no tkinter root is available so the
     caller can fall back to automatic download (service mode, early startup).
     """
     if _tk_root is None:
         raise RuntimeError("no tkinter root available (headless/service mode?)")
+
+    folders_info = []
+    for p in pending_syncs:
+        if not p.get("downloads"):
+            continue
+        count, uploader, ts = _summarize_pending(p)
+        folders_info.append({
+            "friendly": p["friendly"],
+            "count": count,
+            "uploader": uploader,
+            "ts": ts,
+        })
+    if not folders_info:
+        # Nothing to prompt about — treat as accepted (no-op).
+        return True
+
+    n_folders = len(folders_info)
+    max_name = max(len(f["friendly"]) for f in folders_info)
+    max_count_str = max(len(f"{f['count']:,}") for f in folders_info)
+
+    lines = []
+    for f in folders_info:
+        name_part = f["friendly"].ljust(max_name)
+        count_part = f"{f['count']:,}".rjust(max_count_str)
+        files_word = "file" if f["count"] == 1 else "files"
+        if f["uploader"]:
+            if f["ts"]:
+                suffix = f" — from {f['uploader']}, {f['ts']}"
+            else:
+                suffix = f" — from {f['uploader']}"
+        else:
+            suffix = ""
+        lines.append(f"• {name_part}  {count_part} {files_word}{suffix}")
 
     result = {"accepted": None, "failed": False}
     done = threading.Event()
@@ -2055,83 +2166,36 @@ def _prompt_download_consent(friendly: str, downloads: list,
     def _show_dialog():
         try:
             dlg = tk.Toplevel(_tk_root)
-            dlg.title(f"{friendly} sync")
+            dlg.title("Folder Sync")
             dlg.resizable(False, False)
             try:
                 dlg.attributes("-topmost", True)
             except Exception:
                 pass
 
-            n = len(downloads)
             header = tk.Label(
                 dlg,
-                text=f"{friendly} sync",
+                text="Folder Sync",
                 font=("Segoe UI", 11, "bold"),
                 justify="left",
             )
             header.pack(anchor="w", padx=20, pady=(18, 6))
 
+            have_verb = "have" if n_folders != 1 else "has"
+            folder_word = "folders" if n_folders != 1 else "folder"
             summary = tk.Label(
                 dlg,
-                text=f"{n} file{'s' if n != 1 else ''} changed on the Mac.",
+                text=f"{n_folders} {folder_word} {have_verb} updates from other devices:",
                 justify="left",
             )
             summary.pack(anchor="w", padx=20)
 
-            # Pad paths to a common width so the trailing column lines up
-            # visually. Prefer origin info ("from HOST, HH:MM DD/MM/YY") when
-            # the daemon supplies it (v2.7.0+), fall back to the mtime-only
-            # format for pre-v2.7.0 uploads that have no origin record, and
-            # bare-path as a final fallback.
-            mtimes = download_mtimes or {}
-            origins = download_origins or {}
-            preview_rels = downloads[:5]
-            max_path_len = max((len(str(p)) for p in preview_rels), default=0)
-            now = time.time()
-            preview_lines = []
-            for rel in preview_rels:
-                origin = origins.get(rel)
-                origin_str = None
-                if isinstance(origin, dict):
-                    uploader = origin.get("uploader") or "unknown device"
-                    uploaded_at = origin.get("uploaded_at")
-                    try:
-                        ts_clean = str(uploaded_at).rstrip("Z")
-                        dt = datetime.fromisoformat(ts_clean)
-                        # Daemon sends UTC; convert to local for display.
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc).astimezone()
-                        else:
-                            dt = dt.astimezone()
-                        origin_str = (
-                            f"from {uploader}, "
-                            f"{dt.strftime('%H:%M %d/%m/%y')}"
-                        )
-                    except Exception:
-                        origin_str = None
-
-                if origin_str:
-                    preview_lines.append(
-                        f"  • {str(rel).ljust(max_path_len)}  — {origin_str}"
-                    )
-                    continue
-
-                mt = mtimes.get(rel)
-                if mt is not None:
-                    when = _relative_time(mt, now=now)
-                    preview_lines.append(
-                        f"  • {str(rel).ljust(max_path_len)}  ({when})"
-                    )
-                else:
-                    preview_lines.append(f"  • {rel}")
-            if n > 5:
-                preview_lines.append(f"  …and {n - 5} more")
             tk.Label(
                 dlg,
-                text="\n".join(preview_lines),
+                text="\n".join(lines),
                 justify="left",
                 font=("Consolas", 9),
-            ).pack(anchor="w", padx=20, pady=(6, 10))
+            ).pack(anchor="w", padx=20, pady=(8, 10))
 
             tk.Label(dlg, text="Download now?", justify="left").pack(
                 anchor="w", padx=20, pady=(0, 10)
@@ -2176,7 +2240,7 @@ def _prompt_download_consent(friendly: str, downloads: list,
             dlg.focus_force()
             yes_btn.focus_set()
         except Exception as e:
-            log.warning(f"Sync consent dialog failed to render: {e}")
+            log.warning(f"Sync consolidated consent dialog failed to render: {e}")
             result["failed"] = True
             done.set()
 
@@ -2187,18 +2251,9 @@ def _prompt_download_consent(friendly: str, downloads: list,
 
     if not done.wait(timeout=timeout_sec):
         log.warning(
-            f"Sync consent dialog: no response within {timeout_sec:.0f}s — "
+            f"Sync consolidated consent dialog: no response within {timeout_sec:.0f}s — "
             f"treating as No"
         )
-        # Best-effort: tell the tk thread to drop the dialog. We don't wait.
-        def _force_close():
-            # Nothing to close explicitly here — user may still click Yes/No
-            # and that will just be ignored since we've already decided.
-            pass
-        try:
-            _tk_root.after(0, _force_close)
-        except Exception:
-            pass
         return False
 
     if result["failed"]:
@@ -2207,8 +2262,32 @@ def _prompt_download_consent(friendly: str, downloads: list,
     return bool(result["accepted"])
 
 
-def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
-    """Run one sync round for a single target path."""
+_SYNC_FRIENDLY_NAMES = {
+    "wow-addons": "WoW Addons",
+    "wow-wtf": "WoW Settings",
+    "old-cylance": "Cylance Backup",
+}
+
+
+def _sync_one_target_prepare(cfg: dict, hostname: str, target: str,
+                             root: str) -> Optional[dict]:
+    """Pass 1 of the sync round for a single target:
+
+      - walk local manifest
+      - short-circuit if identical to last-run cache
+      - exchange manifest with the server
+      - run uploads (automatic, no prompt)
+
+    Returns a dict describing the target's pending downloads (possibly empty)
+    so the caller can assemble a SINGLE consolidated consent dialog across all
+    targets. Returns None when nothing further is required for this target
+    (local manifest unchanged, or manifest exchange failed).
+
+    The returned dict carries everything pass 2 needs to either save the
+    manifest cache or run the downloads:
+        {target, friendly, root, exclusions, manifest,
+         downloads, download_mtimes, download_origins}
+    """
     exclusions = cfg.get("sync_exclusions", list(SYNC_EXCLUSIONS))
     manifest = _sync_walk_manifest(root, exclusions)
     log.info(f"Sync [{target}] manifest: {len(manifest)} files from {root}")
@@ -2219,7 +2298,7 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
     cached = _sync_load_cached_manifest(target)
     if cached is not None and cached == manifest:
         log.info(f"Sync [{target}] local manifest unchanged since last run — skipping server POST")
-        return
+        return None
 
     try:
         directives = _sync_http_post_json(
@@ -2230,7 +2309,7 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
         )
     except Exception as e:
         log.warning(f"Sync [{target}] manifest exchange failed: {e}")
-        return
+        return None
 
     uploads = directives.get("upload", []) or []
     downloads = directives.get("download", []) or []
@@ -2238,15 +2317,9 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
     download_origins = directives.get("download_origins", {}) or {}
     log.info(f"Sync [{target}] directives: upload={len(uploads)} download={len(downloads)}")
 
-    # Friendly target names for user-facing toasts.
-    _sync_friendly = {
-        "wow-addons": "WoW Addons",
-        "wow-wtf": "WoW Settings",
-        "old-cylance": "Cylance Backup",
-    }
-    friendly = _sync_friendly.get(target, target)
+    friendly = _SYNC_FRIENDLY_NAMES.get(target, target)
 
-    # Uploads: files where our copy is newer.
+    # Uploads run immediately — they're automatic and don't require consent.
     if uploads:
         _notify_user("LangNetmon Sync", f"Syncing {friendly} — uploading {len(uploads)} new files")
     uploads_ok = 0
@@ -2280,61 +2353,33 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
     if uploads:
         _notify_user("LangNetmon Sync", f"Syncing {friendly} — {uploads_ok} files uploaded successfully")
 
-    # Downloads: canonical copy is newer. Requires explicit user consent
-    # (v2.6.0). Uploads above are unaffected and remain automatic.
-    if downloads:
-        dl_hash = _sync_download_hash(downloads)
-        declines = _sync_load_declines()
-        prev = declines.get(target) if isinstance(declines.get(target), dict) else None
+    return {
+        "target": target,
+        "friendly": friendly,
+        "root": root,
+        "exclusions": exclusions,
+        "manifest": manifest,
+        "downloads": downloads,
+        "download_mtimes": download_mtimes,
+        "download_origins": download_origins,
+    }
 
-        if prev and prev.get("hash") == dl_hash:
-            log.info(
-                f"Sync [{target}] {len(downloads)} downloads match a previously "
-                f"declined manifest (hash={dl_hash[:12]}, declined_at="
-                f"{prev.get('declined_at', '?')}) — skipping prompt and download"
-            )
-            downloads = []
-        else:
-            try:
-                accepted = _prompt_download_consent(
-                    friendly, downloads, download_mtimes=download_mtimes,
-                    download_origins=download_origins,
-                )
-                dialog_ok = True
-            except Exception as e:
-                log.warning(
-                    f"Sync [{target}] consent dialog unavailable ({e}) — "
-                    f"falling back to automatic download for {len(downloads)} files"
-                )
-                accepted = True
-                dialog_ok = False
 
-            if dialog_ok and not accepted:
-                declines[target] = {
-                    "hash": dl_hash,
-                    "declined_at": datetime.now().isoformat(timespec="seconds"),
-                    "count": len(downloads),
-                    "friendly": friendly,
-                }
-                _sync_save_declines(declines)
-                log.info(
-                    f"Sync [{target}] user DECLINED download of {len(downloads)} "
-                    f"files (hash={dl_hash[:12]}) — will re-prompt if the manifest changes"
-                )
-                downloads = []
-            else:
-                # Accepted (or fallback) — clear any stale decline entry so future
-                # identical manifests prompt cleanly.
-                if target in declines:
-                    declines.pop(target, None)
-                    _sync_save_declines(declines)
-                if dialog_ok:
-                    log.info(
-                        f"Sync [{target}] user ACCEPTED download of {len(downloads)} files"
-                    )
+def _sync_one_target_execute_downloads(cfg: dict, pending: dict) -> None:
+    """Pass 2 for a single target: actually perform the downloads the user
+    has already consented to (via the consolidated dialog). Emits the
+    progress toasts that the old single-target flow emitted.
+    """
+    target = pending["target"]
+    friendly = pending["friendly"]
+    root = pending["root"]
+    exclusions = pending["exclusions"]
+    downloads = pending["downloads"]
 
-    if downloads:
-        _notify_user("LangNetmon Sync", f"Syncing {friendly} — downloading {len(downloads)} files")
+    if not downloads:
+        return
+
+    _notify_user("LangNetmon Sync", f"Syncing {friendly} — downloading {len(downloads)} files")
     downloads_ok = 0
     for rel in downloads:
         if _sync_is_excluded(rel, exclusions):
@@ -2357,24 +2402,161 @@ def _sync_one_target(cfg: dict, hostname: str, target: str, root: str) -> None:
             downloads_ok += 1
         except Exception as e:
             log.warning(f"Sync [{target}] download failed for {rel}: {e}")
-    if downloads:
-        if downloads_ok == len(downloads):
-            _notify_user("LangNetmon Sync", f"Syncing {friendly} — {downloads_ok} files downloaded successfully")
-        else:
-            _notify_user("LangNetmon Sync", f"Syncing {friendly} — {downloads_ok} of {len(downloads)} files downloaded")
+    if downloads_ok == len(downloads):
+        _notify_user("LangNetmon Sync", f"Syncing {friendly} — {downloads_ok} files downloaded successfully")
+    else:
+        _notify_user("LangNetmon Sync", f"Syncing {friendly} — {downloads_ok} of {len(downloads)} files downloaded")
 
-    # Cache the manifest we just exchanged with the server. When downloads
-    # happened, local files changed so this manifest no longer matches disk —
-    # skip caching and let the next run re-walk + re-POST to re-establish.
-    if not downloads:
-        _sync_save_cached_manifest(target, manifest)
+
+def _sync_run_round(cfg: dict, hostname: str, paths: dict) -> None:
+    """Run one complete sync round across the given targets.
+
+    Two passes:
+      Pass 1 — per-target, in parallel: manifest exchange + uploads (uploads
+               are automatic; no consent required). Each target returns its
+               pending downloads (or None if nothing to do).
+      Pass 2 — build a single "Folder Sync" dialog summarising every folder
+               with pending downloads. On accept, run all approved downloads
+               in parallel. On decline, record a consolidated decline hash so
+               we don't keep re-prompting for an unchanged set.
+
+    Shared by the scheduled sync_loop and the `sync_now` command handler so
+    both see identical consolidated-prompt behaviour.
+    """
+    # ── Pass 1: prepare (manifest + uploads) in parallel ────────
+    prep_results: dict = {}
+    prep_lock = threading.Lock()
+
+    def _run_prepare(tgt: str, rt: str) -> None:
+        try:
+            result = _sync_one_target_prepare(cfg, hostname, tgt, rt)
+        except Exception as e:
+            log.warning(f"Sync [{tgt}] prepare error: {e}")
+            return
+        if result is not None:
+            with prep_lock:
+                prep_results[tgt] = result
+
+    prep_threads = []
+    for target, root in paths.items():
+        th = threading.Thread(
+            target=_run_prepare, args=(target, root),
+            name=f"sync-prep-{target}", daemon=True,
+        )
+        th.start()
+        prep_threads.append((target, th))
+    for target, th in prep_threads:
+        th.join(timeout=300)
+        if th.is_alive():
+            log.warning(f"Sync [{target}] prepare thread still running after 300s join timeout — "
+                        f"continuing; thread will be abandoned")
+
+    # ── Pass 2: consolidated consent + downloads ────────────────
+    # Preserve insertion order of `paths` so the dialog lists targets in the
+    # order the user configured them.
+    ordered_pending = [prep_results[t] for t in paths.keys() if t in prep_results]
+    with_downloads = [p for p in ordered_pending if p["downloads"]]
+    without_downloads = [p for p in ordered_pending if not p["downloads"]]
+
+    # Targets with no downloads: cache the freshly-exchanged manifest so the
+    # next round can short-circuit if nothing changes locally.
+    for p in without_downloads:
+        _sync_save_cached_manifest(p["target"], p["manifest"])
+
+    if not with_downloads:
+        return  # silent: nothing to prompt about this round
+
+    consolidated_hash = _sync_consolidated_download_hash(with_downloads)
+    declines = _sync_load_declines()
+    prev = declines.get("_consolidated") if isinstance(declines.get("_consolidated"), dict) else None
+
+    if prev and prev.get("hash") == consolidated_hash:
+        total = sum(len(p["downloads"]) for p in with_downloads)
+        log.info(
+            f"Sync: {len(with_downloads)} folder(s)/{total} file(s) match a previously "
+            f"declined consolidated manifest (hash={consolidated_hash[:12]}, "
+            f"declined_at={prev.get('declined_at', '?')}) — skipping prompt and downloads"
+        )
+        # Declined-but-unchanged: still safe to cache the local manifest
+        # since no downloads will run this round.
+        for p in with_downloads:
+            _sync_save_cached_manifest(p["target"], p["manifest"])
+        return
+
+    try:
+        accepted = _prompt_consolidated_consent(with_downloads)
+        dialog_ok = True
+    except Exception as e:
+        log.warning(
+            f"Sync: consolidated consent dialog unavailable ({e}) — "
+            f"falling back to automatic download for "
+            f"{len(with_downloads)} folder(s)"
+        )
+        accepted = True
+        dialog_ok = False
+
+    if dialog_ok and not accepted:
+        declines["_consolidated"] = {
+            "hash": consolidated_hash,
+            "declined_at": datetime.now().isoformat(timespec="seconds"),
+            "targets": {
+                p["target"]: {
+                    "friendly": p["friendly"],
+                    "count": len(p["downloads"]),
+                }
+                for p in with_downloads
+            },
+        }
+        _sync_save_declines(declines)
+        total = sum(len(p["downloads"]) for p in with_downloads)
+        log.info(
+            f"Sync: user DECLINED consolidated download of {total} file(s) "
+            f"across {len(with_downloads)} folder(s) "
+            f"(hash={consolidated_hash[:12]}) — will re-prompt if the manifest changes"
+        )
+        # No downloads ran; safe to cache local manifests.
+        for p in with_downloads:
+            _sync_save_cached_manifest(p["target"], p["manifest"])
+        return
+
+    # Accepted (or fallback) — clear any stale consolidated decline entry so
+    # future identical manifests prompt cleanly.
+    if "_consolidated" in declines:
+        declines.pop("_consolidated", None)
+        _sync_save_declines(declines)
+    if dialog_ok:
+        total = sum(len(p["downloads"]) for p in with_downloads)
+        log.info(
+            f"Sync: user ACCEPTED consolidated download of {total} file(s) "
+            f"across {len(with_downloads)} folder(s)"
+        )
+
+    # Run the approved downloads in parallel. Don't cache the manifest —
+    # local state is mutating, let the next round re-walk and re-establish
+    # the cache.
+    dl_threads = []
+    for p in with_downloads:
+        th = threading.Thread(
+            target=_sync_one_target_execute_downloads,
+            args=(cfg, p),
+            name=f"sync-dl-{p['target']}", daemon=True,
+        )
+        th.start()
+        dl_threads.append((p["target"], th))
+    for tgt, th in dl_threads:
+        th.join(timeout=300)
+        if th.is_alive():
+            log.warning(f"Sync [{tgt}] download thread still running after 300s join timeout — "
+                        f"continuing; thread will be abandoned")
 
 
 def sync_loop(cfg: dict) -> None:
     """
     Folder sync. Gated: only runs on hosts listed in sync_enabled_hosts.
     Runs immediately at startup after a short 30s warm-up for the network,
-    then repeats on the hourly interval.
+    then repeats on the hourly interval. Each round delegates to
+    ``_sync_run_round`` so the user sees ONE consolidated consent dialog
+    rather than one per target.
     """
     hostname = socket.gethostname()
     enabled_hosts = [h.upper() for h in cfg.get("sync_enabled_hosts", [])]
@@ -2392,26 +2574,7 @@ def sync_loop(cfg: dict) -> None:
         t0 = time.monotonic()
         try:
             paths = cfg.get("sync_paths", SYNC_PATHS)
-
-            def _run_target(tgt: str, rt: str) -> None:
-                try:
-                    _sync_one_target(cfg, hostname, tgt, rt)
-                except Exception as e:
-                    log.warning(f"Sync [{tgt}] round error: {e}")
-
-            threads = []
-            for target, root in paths.items():
-                th = threading.Thread(
-                    target=_run_target, args=(target, root),
-                    name=f"sync-{target}", daemon=True,
-                )
-                th.start()
-                threads.append((target, th))
-            for target, th in threads:
-                th.join(timeout=300)
-                if th.is_alive():
-                    log.warning(f"Sync [{target}] thread still running after 300s join timeout — "
-                                f"continuing loop; thread will be abandoned")
+            _sync_run_round(cfg, hostname, paths)
         except Exception as e:
             log.error(f"Sync loop error: {e}")
         elapsed = time.monotonic() - t0
