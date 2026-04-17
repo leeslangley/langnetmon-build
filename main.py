@@ -1072,7 +1072,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.8.0"
+AGENT_VERSION = "2.8.1"
 
 
 def _check_for_update(cfg: dict) -> None:
@@ -1113,6 +1113,70 @@ def _mac_http_get_ipv4(mac_ip: str, mac_port: int, path: str, timeout: int = 10)
 
 _UPDATE_DONE_THIS_SESSION: bool = False  # guard against update loops
 
+# Cooldown window between update attempts for the same target version.
+# Prevents the update loop where copy fails silently, old exe restarts,
+# sees newer version, and tries again. 10 min gives Windows/AV time to
+# release locks or surface the real failure in update-errors.log.
+_UPDATE_COOLDOWN_SECONDS = 600
+
+
+def _update_state_dir() -> Path:
+    """%LOCALAPPDATA%\\LangNetmon for update cooldown/error logs. Falls back
+    to the temp dir if LOCALAPPDATA is missing so we never raise here."""
+    import tempfile as _tf
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        d = Path(base) / "LangNetmon"
+    else:
+        d = Path(_tf.gettempdir()) / "LangNetmon"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        d = Path(_tf.gettempdir())
+    return d
+
+
+def _update_cooldown_path() -> Path:
+    return _update_state_dir() / "last-update.json"
+
+
+def _update_errors_path() -> Path:
+    return _update_state_dir() / "update-errors.log"
+
+
+def _update_cooldown_read() -> Optional[dict]:
+    p = _update_cooldown_path()
+    if not p.exists():
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "version" in data and "timestamp" in data:
+            return data
+    except Exception as e:
+        log.debug(f"Auto-update: cooldown read failed: {e}")
+    return None
+
+
+def _update_cooldown_write(target_version: str) -> None:
+    p = _update_cooldown_path()
+    try:
+        tmp = p.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": target_version, "timestamp": time.time()}, f)
+        os.replace(tmp, p)
+    except Exception as e:
+        log.debug(f"Auto-update: cooldown write failed: {e}")
+
+
+def _update_cooldown_clear() -> None:
+    p = _update_cooldown_path()
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception as e:
+        log.debug(f"Auto-update: cooldown clear failed: {e}")
+
 
 def _do_update_check(cfg: dict) -> bool:
     """
@@ -1129,6 +1193,15 @@ def _do_update_check(cfg: dict) -> bool:
         log.debug("Auto-update: already ran this session, skipping")
         return False
 
+    # Success detection: if our current version matches/exceeds the cooldown's
+    # target, the previous update actually landed — clear the cooldown so we
+    # don't suppress future upgrades.
+    cooldown = _update_cooldown_read()
+    if cooldown and _ver_tuple(AGENT_VERSION) >= _ver_tuple(cooldown.get("version", "0")):
+        log.debug(f"Auto-update: prior update to v{cooldown.get('version')} succeeded, clearing cooldown")
+        _update_cooldown_clear()
+        cooldown = None
+
     import tempfile
     mac_ip   = cfg["mac_ip"]
     mac_port = int(cfg["mac_port"])
@@ -1142,6 +1215,18 @@ def _do_update_check(cfg: dict) -> bool:
         if not exe_url or _ver_tuple(remote_version) <= _ver_tuple(AGENT_VERSION):
             log.debug(f"Auto-update: up to date (local={AGENT_VERSION} remote={remote_version})")
             return False
+
+        # Cooldown check: if we attempted this exact target recently and it
+        # clearly didn't take effect (we're still on the old version), back
+        # off. The user should inspect update-errors.log.
+        if cooldown and cooldown.get("version") == remote_version:
+            age = time.time() - float(cooldown.get("timestamp", 0))
+            if age < _UPDATE_COOLDOWN_SECONDS:
+                log.info(
+                    f"Auto-update: recent attempt for v{remote_version} "
+                    f"({int(age)}s ago) — backing off"
+                )
+                return False
 
         log.info(f"Auto-update: new version {remote_version} available, downloading...")
 
@@ -1163,26 +1248,50 @@ def _do_update_check(cfg: dict) -> bool:
         tmp.close()
 
         current_exe = sys.executable
+        err_log = str(_update_errors_path())
+
         bat = tempfile.NamedTemporaryFile(
             delete=False, suffix=".bat", dir=tempfile.gettempdir(), mode="w"
         )
+        # - 10s timeout (was 3s) gives Windows/AV time to release file locks
+        # - copy errors redirected to update-errors.log (not suppressed) so
+        #   silent failures are diagnosable
+        # - start /b launched via the bat is what wscript-hides; no stray window
         bat.write(
             f"@echo off\r\n"
-            f"timeout /t 3 /nobreak >nul 2>&1\r\n"
-            f"copy /Y \"{tmp.name}\" \"{current_exe}\" >nul 2>&1\r\n"
+            f"timeout /t 10 /nobreak >nul 2>&1\r\n"
+            f"echo [%date% %time%] attempting copy of \"{tmp.name}\" to \"{current_exe}\" >> \"{err_log}\"\r\n"
+            f"copy /Y \"{tmp.name}\" \"{current_exe}\" >> \"{err_log}\" 2>&1\r\n"
+            f"if errorlevel 1 echo [%date% %time%] COPY FAILED with errorlevel %errorlevel% >> \"{err_log}\"\r\n"
             f"del \"{tmp.name}\" >nul 2>&1\r\n"
-            f"start /b \"\" \"{current_exe}\"\r\n"
+            f"start \"\" \"{current_exe}\"\r\n"
             f"(del \"%~f0\") >nul 2>&1\r\n"
         )
         bat.close()
 
-        _si = subprocess.STARTUPINFO()
-        _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        _si.wShowWindow = subprocess.SW_HIDE
+        # VBS launcher: wscript runs the bat with window-style 0 (hidden).
+        # This is the only reliably-silent way to invoke a .bat on Windows —
+        # subprocess creationflags alone can't suppress the cmd window that
+        # a .bat inherently spawns.
+        vbs = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".vbs", dir=tempfile.gettempdir(), mode="w"
+        )
+        bat_path_escaped = bat.name.replace('"', '""')
+        vbs.write(
+            'Set WshShell = CreateObject("WScript.Shell")\r\n'
+            f'WshShell.Run Chr(34) & "{bat_path_escaped}" & Chr(34), 0, False\r\n'
+        )
+        vbs.close()
+
+        # Record the attempt BEFORE launching — if copy fails and the old exe
+        # restarts, the cooldown is already in place to break the loop.
+        _update_cooldown_write(remote_version)
+
+        # DETACHED_PROCESS only — CREATE_NO_WINDOW + DETACHED_PROCESS conflict
+        # on Windows and the combination can actually flash a visible console.
         subprocess.Popen(
-            ["cmd", "/c", bat.name],
-            startupinfo=_si,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            ["wscript.exe", vbs.name],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             close_fds=True,
         )
         log.info(f"Auto-update: v{remote_version} launcher started, exiting")
