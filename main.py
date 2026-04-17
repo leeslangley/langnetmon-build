@@ -1018,7 +1018,7 @@ class NetMonWindow:
 
 # ── Version & auto-update ──────────────────────────────────────────────────
 
-AGENT_VERSION = "2.3.1"
+AGENT_VERSION = "2.4.0"
 
 
 def _check_for_update(cfg: dict) -> None:
